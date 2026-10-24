@@ -206,6 +206,23 @@ window.FlowvizAsk = (() => {
       }
     }
 
+    // Unsupported questions get the nearest answerable chips as pivots
+    // (plan 5.1: never a dead end). Verified questions are one click away.
+    if (d.state === "unsupported" && catalogData?.questions) {
+      const label = document.createElement("div");
+      label.className = "ask-note";
+      label.textContent = "Closest answerable questions:";
+      out.appendChild(label);
+      for (const q of catalogData.questions) {
+        if (q.status !== "available") continue;
+        const b = document.createElement("button");
+        b.className = "chip";
+        b.textContent = q.question;
+        b.addEventListener("click", () => ask(q.question));
+        out.appendChild(b);
+      }
+    }
+
     if (d.state === "scenario") {
       renderTimeline(d.scenarioTimeline || [], out);
       renderNotes(d.notes || [], out);

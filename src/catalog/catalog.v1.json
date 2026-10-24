@@ -14,7 +14,9 @@
     "dns_queries.client_hash is salted sha256(client_string + per-deployment salt) since 2026-10-24T08:42Z. Rows before that boundary use unsalted sha256(client_string) and are NOT comparable across the boundary: the same client appears as two different hashes. Group by client_hash within one era only. As of 2026-10-24T12:00Z the exact salt handling on the ingest host has an unresolved discrepancy (computed digests over the LAN /24 and known v6 addresses do not match observed hashes): treat client_hash as OPAQUE and do not label identities until the map is regenerated and verified against a controlled query.",
     "dnsmasq lines are deliberately excluded from homelab.syslog since 2026-10-24T08:42Z (privacy: raw dnsmasq lines carry client addresses in cleartext). They exist only in dns_queries with the client salted. Historic pre-08:42 rows remain in syslog.",
     "Router-origin syslog event times (ts) drift vs ingest time (observed ~7.5 minutes behind on 2026-10-24). Time-bound syslog queries with __ingest_ts, not ts.",
-    "The ticker is a sampled, sanitized surface and is never evidence. Detection and investigation always query Basin tables."
+    "The ticker is a sampled, sanitized surface and is never evidence. Detection and investigation always query Basin tables.",
+    "The UniFi Integration API clients endpoint exposes NO radio metrics: verified live 2026-10-24 (zero occurrences of signal or rssi in any poll; client objects carry access, connectedAt, id, ipAddress, macAddress, name, type, uplinkDeviceId only). For ANY wifi-quality or wifi-speed question (slow wifi, dropouts, how is my wifi): do NOT return unsupported. Plan the q-wifi-clients verified question as the primary answer (connected-client counts over time show disconnects and rejoins), let the user pivot to DNS volume as the working-internet proxy, and the notes state that radio quality (signal, throughput, airtime) is not observable with current telemetry. Client counting over the 38 KB body uses the string-replace length trick, not json_get_*.",
+    "For questions about a specific service or app experience (Zoom calls, streaming, a specific site being slow): do NOT return unsupported. Plan a timeseries-count on homelab.dns_queries with a domain filter (ILIKE on the service domain, e.g. '%zoom.us%') to locate activity windows, optionally together with q-wifi-clients. State in the notes that per-call quality, WAN latency and client-side stats are not observable, and that DNS bursts only mark when the service was used."
   ],
   "clientHashIdentities": {},
   "entityMaps": {
@@ -275,21 +277,21 @@
       "columns": [
         { "name": "event_id", "type": "string" },
         { "name": "ts", "type": "timestamp" },
-        { "name": "fields", "type": "json", "jsonPaths": ["body"], "note": "one row per 60 s poll; fields ~38 KB" }
+        { "name": "fields", "type": "json", "jsonPaths": ["body"], "note": "one row per 60 s poll; fields ~38 KB: JSON functions unusable, string-replace counting works" }
       ],
       "queryTimeColumn": "ts",
       "queryTimeBasis": "observation",
       "grain": "one row per poll containing a body array of all clients",
       "privacyClass": "raw",
-      "synonyms": ["unifi", "clients", "wifi clients", "devices"],
+      "synonyms": ["unifi", "clients", "wifi clients", "wifi", "connected devices", "devices", "wireless"],
       "caveats": [
         "Not one row per client: each row is a snapshot with an array under body",
-        "body contains raw MACs, IPs and hostnames: raw privacy class",
-        "Signal strength or per-client RSSI availability is unprobed: wifi-quality questions stay gated"
+        "The Integration API exposes no radio metrics: verified live 2026-10-24 (zero occurrences of signal or rssi across all polls; client objects carry access, connectedAt, id, ipAddress, macAddress, name, type, uplinkDeviceId only). Wifi-quality questions are answered with the connected-client view plus DNS activity, and state that radio quality is not observable",
+        "Body arrays exceed the 2000-byte JSON function cap: count clients with the string-replace length trick (see q-wifi-clients), not json_get_*",
+        "body contains raw MACs, IPs and hostnames: raw privacy class, never sent to models or delivery channels"
       ],
-      "status": "probe-gated",
-      "statusNote": "same 38 KB cap problem as unifi_devices; wifi question stays disabled until a field inventory probe succeeds",
-      "verified": []
+      "status": "available",
+      "verified": ["q-wifi-clients"]
     },
     {
       "id": "cfwork.workers_trace_events",
@@ -548,6 +550,23 @@
       "sql": "SELECT ScriptName, Outcome, COUNT(*) AS c FROM cfwork.workers_trace_events WHERE __ingest_ts >= {FROM} AND __ingest_ts < {TO} GROUP BY ScriptName, Outcome ORDER BY c DESC LIMIT 15",
       "params": { "windowHours": 24 },
       "notes": ["Detectors over this table must exclude ScriptName = 'basin-flowviz' (recursion guard)"],
+      "status": "available",
+      "verifiedAt": "2026-10-24",
+      "verifiedBy": "Phase 0 live probes"
+    },
+    {
+      "id": "q-wifi-clients",
+      "question": "How many wifi and wired clients are connected, and how has that changed over the last 24 hours?",
+      "archetype": "timeseries-count",
+      "table": "homelab.unifi_clients",
+      "chart": "time-series",
+      "sql": "SELECT date_trunc('hour', ts) AS bucket, 'wireless' AS series, ROUND(AVG((LENGTH(fields) - LENGTH(replace(fields, '\\\"type\\\":\\\"WIRELESS\\\"', ''))) / 21.0), 1) AS c, COUNT(*) AS polls FROM homelab.unifi_clients WHERE ts >= {FROM} AND ts < {TO} GROUP BY date_trunc('hour', ts) UNION ALL SELECT date_trunc('hour', ts), 'wired', ROUND(AVG((LENGTH(fields) - LENGTH(replace(fields, '\\\"type\\\":\\\"WIRED\\\"', ''))) / 17.0), 1), COUNT(*) FROM homelab.unifi_clients WHERE ts >= {FROM} AND ts < {TO} GROUP BY date_trunc('hour', ts) ORDER BY bucket LIMIT 2000",
+      "params": { "windowHours": 24 },
+      "notes": [
+        "Counts are per 60 s poll, averaged per hour; a drop means clients disconnected or the poller missed a beat, not that the house went quiet",
+        "Radio quality (signal, throughput, airtime) is not observable: the Integration API exposes no radio metrics (verified 2026-10-24)",
+        "Client names and MACs stay in the evidence rows; the chart shows counts only"
+      ],
       "status": "available",
       "verifiedAt": "2026-10-24",
       "verifiedBy": "Phase 0 live probes"

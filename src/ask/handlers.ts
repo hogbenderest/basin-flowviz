@@ -278,6 +278,7 @@ export async function handleAsk(env: ServiceEnv, req: Request): Promise<Response
     filesScanned: result.metrics.filesScanned,
     windowHours: Number(windowHours),
     truncated: result.truncation.applied ? "yes" : "no",
+    meaning: out.notes.slice(0, 3).join(" | ").slice(0, 400),
   };
   const firstRow = result.rows[0];
   if (firstRow?.dim !== undefined) stats.top = `${String(firstRow.dim)} (${firstRow.m})`;
