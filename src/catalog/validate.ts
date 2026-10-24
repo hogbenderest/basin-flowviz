@@ -180,56 +180,58 @@ export function compilePlan(plan: QueryPlan, question: string, now: Date): PlanO
   if (!w) return { ok: false, error: "invalid or missing time window" };
 
   // Verified-question shortcut: the catalogue carries either literal SQL or
-  // compiler params; both are owner-checked and produce bounded SQL.
+  // compiler params; both are owner-checked and produce bounded SQL. An
+  // unknown id falls through to archetype compilation instead of failing.
   if (plan.verifiedQueryId) {
     const v = getQuestion(plan.verifiedQueryId);
-    if (!v) return { ok: false, error: `unknown verified question ${plan.verifiedQueryId}` };
-    if (v.status !== "available") {
-      return { ok: false, unsupported: v.notes.join(" ") || "verified question is not available" };
-    }
-    const vw = resolveWindow(
-      {
-        ...(v.params?.windowHours
-          ? { fromUTC: new Date(now.getTime() - (v.params.windowHours as number) * 3600_000).toISOString(), toUTC: now.toISOString() }
-          : {}),
-        ...plan,
-      } as QueryPlan,
-      now,
-    );
-    if (!vw) return { ok: false, error: "invalid window for verified question" };
-    let sql: string;
-    if (v.sql) {
-      sql = fillLiteralSql(v.sql, vw);
-    } else {
-      const built = buildFromParams(v, vw, now);
-      if ("error" in built) return { ok: false, error: built.error };
-      sql = built.sql;
-    }
-    let baselineSql: string | undefined;
-    let baseline: ChartSpec["baseline"];
-    if ((v.params?.baseline as boolean) || plan.chart?.baseline) {
-      const spanMs = Date.parse(vw.toUTC) - Date.parse(vw.fromUTC);
-      baseline = {
-        fromUTC: new Date(Date.parse(vw.fromUTC) - spanMs).toISOString(),
-        toUTC: vw.fromUTC,
-      };
-      if (v.sql) {
-        baselineSql = fillLiteralSql(v.sql, baseline);
-      } else {
-        const built = buildFromParams(v, baseline, now);
-        if ("error" in built) return { ok: false, error: built.error };
-        baselineSql = built.sql;
+    if (v) {
+      if (v.status !== "available") {
+        return { ok: false, unsupported: v.notes.join(" ") || "verified question is not available" };
       }
+      const vw = resolveWindow(
+        {
+          ...(v.params?.windowHours
+            ? { fromUTC: new Date(now.getTime() - (v.params.windowHours as number) * 3600_000).toISOString(), toUTC: now.toISOString() }
+            : {}),
+          ...plan,
+        } as QueryPlan,
+        now,
+      );
+      if (!vw) return { ok: false, error: "invalid window for verified question" };
+      let sql: string;
+      if (v.sql) {
+        sql = fillLiteralSql(v.sql, vw);
+      } else {
+        const built = buildFromParams(v, vw, now);
+        if ("error" in built) return { ok: false, error: built.error };
+        sql = built.sql;
+      }
+      let baselineSql: string | undefined;
+      let baseline: ChartSpec["baseline"];
+      if ((v.params?.baseline as boolean) || plan.chart?.baseline) {
+        const spanMs = Date.parse(vw.toUTC) - Date.parse(vw.fromUTC);
+        baseline = {
+          fromUTC: new Date(Date.parse(vw.fromUTC) - spanMs).toISOString(),
+          toUTC: vw.fromUTC,
+        };
+        if (v.sql) {
+          baselineSql = fillLiteralSql(v.sql, baseline);
+        } else {
+          const built = buildFromParams(v, baseline, now);
+          if ("error" in built) return { ok: false, error: built.error };
+          baselineSql = built.sql;
+        }
+      }
+      const chart = defaultChart(v.chart, question || v.question, vw, undefined, undefined, undefined, baseline);
+      return {
+        ok: true,
+        compiled: { sql, primaryTable: v.table, baselineSql },
+        chart,
+        notes: v.notes,
+        fromUTC: vw.fromUTC,
+        toUTC: vw.toUTC,
+      };
     }
-    const chart = defaultChart(v.chart, question || v.question, vw, undefined, undefined, undefined, baseline);
-    return {
-      ok: true,
-      compiled: { sql, primaryTable: v.table, baselineSql },
-      chart,
-      notes: v.notes,
-      fromUTC: vw.fromUTC,
-      toUTC: vw.toUTC,
-    };
   }
 
   if (plan.archetype === "unsupported") {

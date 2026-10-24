@@ -212,11 +212,30 @@ function coercePlan(raw: unknown): QueryPlan | null {
     plan.ambiguities = (r.ambiguities as unknown[]).slice(0, 4).map((a) => String(a).slice(0, 120));
   }
   if (typeof r.unsupportedReason === "string") plan.unsupportedReason = r.unsupportedReason.slice(0, 400);
-  if (typeof r.verifiedQueryId === "string") plan.verifiedQueryId = r.verifiedQueryId;
+  if (typeof r.verifiedQueryId === "string") {
+    const v = r.verifiedQueryId.trim().replace(/[""']/g, "");
+    if (v) plan.verifiedQueryId = v;
+  }
   return plan;
 }
 
 type PlanFilterOp = "=" | "LIKE" | "ILIKE" | "IN";
+
+// The account's AI gateway may return either the simple { response } shape or
+// the OpenAI chat-completions envelope { choices: [{ message: { content } }] }.
+export function extractModelText(out: unknown): string | null {
+  if (!out || typeof out !== "object") return null;
+  const o = out as Record<string, unknown>;
+  if (typeof o.response === "string" && o.response) return o.response;
+  const choices = o.choices;
+  if (Array.isArray(choices) && choices.length > 0) {
+    const msg = (choices[0] as Record<string, unknown>)?.message as
+      | Record<string, unknown>
+      | undefined;
+    if (msg && typeof msg.content === "string") return msg.content;
+  }
+  return null;
+}
 
 async function callModel(
   env: ServiceEnv,
@@ -226,18 +245,30 @@ async function callModel(
 ): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
   if (!env.AI) return { ok: false, error: "AI binding not configured" };
   try {
-    const out = (await env.AI.run(model(env), {
+    const out = await env.AI.run(model(env), {
       messages,
       response_format: schema,
       max_tokens: maxTokens,
       temperature: 0.2,
-    })) as { response?: string } | null;
-    if (!out || typeof out.response !== "string") {
-      return { ok: false, error: "model returned no response" };
+    });
+    const text = extractModelText(out);
+    if (!text) {
+      // Surface the service's own error fields for diagnosis; logpush ships
+      // this to cfwork.workers_trace_events (never log secrets or bodies).
+      const detail = !out
+        ? "null result"
+        : JSON.stringify(
+            (out as Record<string, unknown>).errors ??
+              Object.keys(out as Record<string, unknown>).join(","),
+          ).slice(0, 300);
+      console.error("ai call failed:", detail);
+      return { ok: false, error: `model response missing: ${detail}` };
     }
-    return { ok: true, text: out.response };
+    return { ok: true, text };
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "model call failed" };
+    const msg = e instanceof Error ? e.message : "model call failed";
+    console.error("ai call threw:", msg.slice(0, 300));
+    return { ok: false, error: msg };
   }
 }
 
@@ -377,8 +408,9 @@ export async function narrateAnswer(
       max_tokens: 220,
       temperature: 0.2,
     })) as { response?: string } | null;
-    if (out?.response) {
-      const parsed = extractJson(out.response) as { answer?: string } | null;
+    const text = extractModelText(out);
+    if (text) {
+      const parsed = extractJson(text) as { answer?: string } | null;
       if (parsed?.answer && typeof parsed.answer === "string" && parsed.answer.length < 600) {
         return { answer: parsed.answer, usedModel: true };
       }

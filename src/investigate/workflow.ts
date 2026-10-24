@@ -10,6 +10,7 @@ import { executeGoverned, snapshotEvidence } from "../query/service";
 import { catalog } from "../catalog/render";
 import type { EvidenceRecord, Finding, InvestigationReport } from "../catalog/types";
 import type { SchedulerEnv } from "./detectors";
+import { extractModelText } from "../ask/planner";
 
 export interface DnsVolumeParams {
   detectorId: string;
@@ -288,9 +289,10 @@ async function synthesize(
       response_format: SYNTHESIS_MODEL_SCHEMA,
       max_tokens: 700,
       temperature: 0.2,
-    })) as { response?: string } | null;
-    if (!out?.response) return fallback;
-    const parsed = JSON.parse(stripFence(out.response)) as Partial<SynthesisResult> & {
+    })) as unknown;
+    const text = extractModelText(out);
+    if (!text) return fallback;
+    const parsed = JSON.parse(stripFence(text)) as Partial<SynthesisResult> & {
       findings?: SynthesisResult["findings"];
     };
     const ALLOWED = ["suspicious", "benign", "inconclusive", "informational"];
