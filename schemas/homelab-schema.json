@@ -1,0 +1,10 @@
+{
+  "fields": [
+    { "name": "event_id", "type": "string", "required": true },
+    { "name": "event_type", "type": "string", "required": true },
+    { "name": "host", "type": "string", "required": false },
+    { "name": "ts", "type": "timestamp", "required": true },
+    { "name": "message", "type": "string", "required": false },
+    { "name": "fields", "type": "json", "required": false }
+  ]
+}

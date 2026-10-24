@@ -1,0 +1,656 @@
+/* Basin live data flow demo.
+ *
+ * Structure on purpose: the DATA section (columns + edges) is pure config,
+ * the RENDER section draws it, and the LIVE section wires stats/ticker.
+ * The renderer can be swapped (e.g. for React Flow later) without touching
+ * data or live wiring.
+ */
+(() => {
+  "use strict";
+
+  // ------------------------------------------------------------------
+  // DATA: five columns and the edge list. ids are referenced by EDGES.
+  // ------------------------------------------------------------------
+
+  const COLUMNS = [
+    {
+      id: "sources",
+      title: "Sources",
+      cards: [
+        { id: "bsky", label: "Bluesky Jetstream", sub: "wss firehose, DO consumer", cls: "src" },
+        { id: "ha", label: "Home Assistant", sub: "mqtt_statestream, HA Pi", cls: "src" },
+        { id: "server111", label: "Homelab hosts", sub: "server111 + Pis: journald, metrics", cls: "src" },
+        { id: "unifi", label: "UniFi", sub: "remote syslog + Integration API", cls: "src" },
+        { id: "dns", label: "House DNS", sub: "dnsmasq via router syslog", cls: "src" },
+        { id: "openwrt", label: "OpenWrt", sub: "remote syslog", cls: "src" },
+        { id: "zone", label: "Zone logs", sub: "ihogben.com Logpush", cls: "src cf" },
+        { id: "worker", label: "This Worker", sub: "workers_trace_events", cls: "src cf" },
+      ],
+    },
+    {
+      id: "streams",
+      title: "Streams",
+      cards: [
+        { id: "s_bsky", label: "bsky_events_stream", sub: "Worker binding, HTTP off", cls: "stream" },
+        { id: "s_ha", label: "ha_events", sub: "HTTP ingest, authed", cls: "stream" },
+        { id: "s_hl", label: "homelab_events", sub: "HTTP ingest, authed", cls: "stream" },
+        { id: "s_zhttp", label: "logpush: http_requests", sub: "auto-created", cls: "stream" },
+        { id: "s_zfw", label: "logpush: firewall_events", sub: "auto-created", cls: "stream" },
+        { id: "s_zdns", label: "logpush: dns_logs", sub: "auto-created", cls: "stream" },
+        { id: "s_wt", label: "logpush: workers_trace_events", sub: "auto-created", cls: "stream" },
+      ],
+    },
+    {
+      id: "pipelines",
+      title: "Pipelines",
+      cards: [
+        { id: "p_bsky", label: "bsky_pipeline", sub: "5x INSERT WHERE event_type", cls: "pipe" },
+        { id: "p_ha", label: "ha_pipeline", sub: "2x INSERT", cls: "pipe" },
+        { id: "p_hl", label: "homelab_pipeline", sub: "5x INSERT WHERE event_type", cls: "pipe" },
+        { id: "p_lp", label: "Logpush pipelines", sub: "sha256 + noise drop, at job creation", cls: "pipe" },
+      ],
+    },
+    {
+      id: "tables",
+      title: "Tables (Basin Catalog / Iceberg)",
+      groups: [
+        { name: "ns: bsky", cards: [
+          { id: "t_post", label: "bsky_post", sub: "posts", cls: "table" },
+          { id: "t_like", label: "bsky_like", sub: "likes", cls: "table" },
+          { id: "t_repost", label: "bsky_repost", sub: "reposts", cls: "table" },
+          { id: "t_follow", label: "bsky_follow", sub: "follows", cls: "table" },
+          { id: "t_block", label: "bsky_block", sub: "blocks", cls: "table" },
+        ]},
+        { name: "ns: ha", cards: [
+          { id: "t_ha_state", label: "ha_state_changes", sub: "state changes", cls: "table" },
+          { id: "t_ha_sensor", label: "ha_sensor_readings", sub: "sensor readings", cls: "table" },
+        ]},
+        { name: "ns: homelab", cards: [
+          { id: "t_syslog", label: "syslog", sub: "server111, Pis, OpenWrt, UniFi", cls: "table" },
+          { id: "t_metrics", label: "host_metrics", sub: "per-host metrics", cls: "table" },
+          { id: "t_udev", label: "unifi_devices", sub: "UniFi devices", cls: "table" },
+          { id: "t_ucli", label: "unifi_clients", sub: "UniFi clients", cls: "table" },
+          { id: "t_dnsq", label: "dns_queries", sub: "house DNS", cls: "table" },
+        ]},
+        { name: "ns: Logpush zone", cards: [
+          { id: "t_zhttp", label: "ihogben: http_requests", sub: "hashed IPs", cls: "table" },
+          { id: "t_zfw", label: "ihogben: firewall_events", sub: "WAF events", cls: "table" },
+          { id: "t_zdns", label: "ihogben: dns_logs", sub: "zone DNS", cls: "table" },
+        ]},
+        { name: "ns: Worker", cards: [
+          { id: "t_wt", label: "workers_trace_events", sub: "this Worker's own logs", cls: "table" },
+        ]},
+      ],
+    },
+    {
+      id: "engines",
+      title: "Query interop",
+      groups: [
+        { name: "included with Basin", cards: [
+          { id: "e_sql", label: "Basin SQL", sub: "REST - live; used by this console", cls: "engine primary" },
+        ]},
+        { name: "direct interop (Iceberg REST)", cards: [
+          { id: "e_duck", label: "DuckDB", sub: "reads via Basin Catalog", cls: "engine" },
+          { id: "e_trino", label: "Trino", sub: "reads via Basin Catalog", cls: "engine" },
+          { id: "e_snow", label: "Snowflake", sub: "via Basin Catalog; its compute billed separately", cls: "engine" },
+          { id: "e_spark", label: "Apache Spark", sub: "PyIceberg interop", cls: "engine" },
+          { id: "e_pyspark", label: "PySpark", sub: "writes to existing tables", cls: "engine" },
+        ]},
+        { name: "existing BI investments", cards: [
+          { id: "e_tableau", label: "Tableau", sub: "keeps its connector; points it at Trino/Snowflake", cls: "engine" },
+          { id: "e_qlik", label: "Qlik", sub: "via Trino / ODBC", cls: "engine" },
+          { id: "e_powerbi", label: "Power BI", sub: "via Snowflake connector", cls: "engine" },
+        ]},
+      ],
+    },
+  ];
+
+  // [from, to, color]
+  const EDGES = [
+    // Bluesky column (blue)
+    ["bsky", "s_bsky", "blue"],
+    ["s_bsky", "p_bsky", "blue"],
+    ["p_bsky", "t_post", "blue"], ["p_bsky", "t_like", "blue"], ["p_bsky", "t_repost", "blue"],
+    ["p_bsky", "t_follow", "blue"], ["p_bsky", "t_block", "blue"],
+    // LAN columns (green)
+    ["ha", "s_ha", "green"], ["server111", "s_hl", "green"], ["unifi", "s_hl", "green"],
+    ["dns", "s_hl", "green"], ["openwrt", "s_hl", "green"],
+    ["s_ha", "p_ha", "green"], ["s_hl", "p_hl", "green"],
+    ["p_ha", "t_ha_state", "green"], ["p_ha", "t_ha_sensor", "green"],
+    ["p_hl", "t_syslog", "green"], ["p_hl", "t_metrics", "green"], ["p_hl", "t_udev", "green"],
+    ["p_hl", "t_ucli", "green"], ["p_hl", "t_dnsq", "green"],
+    // Cloudflare columns (orange)
+    ["zone", "s_zhttp", "orange"], ["zone", "s_zfw", "orange"], ["zone", "s_zdns", "orange"],
+    ["worker", "s_wt", "orange"],
+    ["s_zhttp", "p_lp", "orange"], ["s_zfw", "p_lp", "orange"], ["s_zdns", "p_lp", "orange"],
+    ["s_wt", "p_lp", "orange"],
+    ["p_lp", "t_zhttp", "orange"], ["p_lp", "t_zfw", "orange"], ["p_lp", "t_zdns", "orange"],
+    ["p_lp", "t_wt", "orange"],
+  ];
+
+  // every table -> Basin SQL; a few interop edges
+  const ALL_TABLES = [
+    "t_post", "t_like", "t_repost", "t_follow", "t_block",
+    "t_ha_state", "t_ha_sensor",
+    "t_syslog", "t_metrics", "t_udev", "t_ucli", "t_dnsq",
+    "t_zhttp", "t_zfw", "t_zdns", "t_wt",
+  ];
+  for (const t of ALL_TABLES) EDGES.push([t, "e_sql", "dim"]);
+  EDGES.push(["t_post", "e_duck", "dim"], ["t_zhttp", "e_duck", "dim"]);
+  EDGES.push(["t_dnsq", "e_trino", "dim"], ["t_syslog", "e_trino", "dim"]);
+  EDGES.push(["t_zhttp", "e_snow", "dim"]);
+  EDGES.push(["t_like", "e_spark", "dim"], ["t_post", "e_pyspark", "dim"]);
+  // BI tools ride on the interop engines they already support.
+  EDGES.push(["e_trino", "e_tableau", "dim"], ["e_trino", "e_qlik", "dim"], ["e_snow", "e_powerbi", "dim"]);
+
+  // ------------------------------------------------------------------
+  // RENDER
+  // ------------------------------------------------------------------
+
+  const flow = document.getElementById("flow");
+  const svg = document.getElementById("edges");
+  const columnsEl = document.getElementById("columns");
+
+  function renderColumns() {
+    columnsEl.innerHTML = "";
+    for (const col of COLUMNS) {
+      const colEl = document.createElement("section");
+      colEl.className = "column";
+      const t = document.createElement("div");
+      t.className = "column-title";
+      t.textContent = col.title;
+      colEl.appendChild(t);
+      const addCard = (c) => {
+        const el = document.createElement("div");
+        el.className = "card " + (c.cls || "");
+        el.dataset.id = c.id;
+        el.innerHTML = `<div class="card-title"></div><div class="card-sub"></div>`;
+        el.querySelector(".card-title").textContent = c.label;
+        el.querySelector(".card-sub").textContent = c.sub || "";
+        el.addEventListener("click", () => {
+          document.dispatchEvent(
+            new CustomEvent("flowviz:card", { detail: { id: c.id, label: c.label } }),
+          );
+        });
+        colEl.appendChild(el);
+      };
+      if (col.groups) {
+        for (const g of col.groups) {
+          const gh = document.createElement("div");
+          gh.className = "group";
+          gh.textContent = g.name;
+          colEl.appendChild(gh);
+          for (const c of g.cards) addCard(c);
+        }
+      } else if (col.cards) {
+        for (const c of col.cards) addCard(c);
+      }
+      columnsEl.appendChild(colEl);
+    }
+  }
+
+  const edgePaths = []; // {pathEl, len, color, from, to}
+
+  function layoutEdges() {
+    const fr = flow.getBoundingClientRect();
+    svg.setAttribute("viewBox", `0 0 ${fr.width} ${fr.height}`);
+    svg.innerHTML = "";
+    edgePaths.length = 0;
+    particles.length = 0; // indexes are rebuilt below; drop in-flight particles
+    circles.length = 0;
+    for (const [from, to, color] of EDGES) {
+      const a = columnsEl.querySelector(`[data-id="${from}"]`);
+      const b = columnsEl.querySelector(`[data-id="${to}"]`);
+      if (!a || !b) continue;
+      const ra = a.getBoundingClientRect();
+      const rb = b.getBoundingClientRect();
+      // Skip edges whose either endpoint is scrolled out of the flow area:
+      // a path anchored to a hidden card would sweep through the middle of
+      // the screen, and its dots would appear to run off the bottom edge.
+      // Edges materialize as their cards scroll into view.
+      const M = 24;
+      if (
+        ra.top - fr.top > fr.height + M ||
+        rb.top - fr.top > fr.height + M ||
+        ra.bottom - fr.top < -M ||
+        rb.bottom - fr.top < -M
+      ) {
+        continue;
+      }
+      const x1 = ra.right - fr.left;
+      const y1 = ra.top + ra.height / 2 - fr.top;
+      const x2 = rb.left - fr.left;
+      const y2 = rb.top + rb.height / 2 - fr.top;
+      const mx = (x1 + x2) / 2;
+      const p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      p.setAttribute("d", `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`);
+      p.setAttribute("stroke", color === "dim" ? "#212736" : "#2a3143");
+      p.setAttribute("stroke-width", "1.4");
+      p.setAttribute("fill", "none");
+      p.setAttribute("data-from", from);
+      p.setAttribute("data-to", to);
+      svg.appendChild(p);
+      edgePaths.push({ pathEl: p, len: p.getTotalLength(), color, from, to });
+    }
+  }
+
+  // Re-layout on scroll/resize, debounced to one run per frame so paths
+  // always track card positions (the Tables column scrolls; frozen paths
+  // make dots miss their targets).
+  let layoutQueued = false;
+  function scheduleLayout() {
+    if (layoutQueued) return;
+    layoutQueued = true;
+    requestAnimationFrame(() => {
+      layoutQueued = false;
+      layoutEdges();
+    });
+  }
+
+  // ---- particles ----
+
+  const particles = []; // {idx, t, speed, color}
+  const COLORS = {
+    blue: "#4aa3ff",
+    green: "#2fd48f",
+    orange: "#f6821f",
+    dim: "#7a5a36",
+  };
+  const circles = [];
+
+  function getCircle(i) {
+    while (circles.length <= i) {
+      const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      c.setAttribute("r", "3.1");
+      c.setAttribute("opacity", "0.9");
+      svg.appendChild(c);
+      circles.push(c);
+    }
+    return circles[i];
+  }
+
+  let rates = { blue: 0.4, green: 0.9, orange: 0.35, dim: 0.5 }; // particles/sec per color (ambient)
+  const TARGET_CAP = { blue: 42, green: 60, orange: 26, dim: 34 };
+  const liveCounts = { blue: 0, green: 0, orange: 0, dim: 0 };
+
+  function countLive(color) {
+    let n = 0;
+    for (const p of particles) if (edgePaths[p.idx].color === color) n++;
+    return n;
+  }
+
+  let lastFrame = performance.now();
+
+  function frame(now) {
+    const dt = Math.min((now - lastFrame) / 1000, 0.1);
+    lastFrame = now;
+
+    for (const color of Object.keys(rates)) {
+      const target = Math.min(rates[color], TARGET_CAP[color]);
+      liveCounts[color] = countLive(color);
+      if (liveCounts[color] < target && Math.random() < rates[color] * dt) {
+        const pool = edgePaths
+          .map((e, i) => (e.color === color ? i : -1))
+          .filter((i) => i >= 0);
+        if (pool.length) {
+          const idx = pool[Math.floor(Math.random() * pool.length)];
+          particles.push({
+            idx,
+            t: 0,
+            speed: (140 + Math.random() * 80) / edgePaths[idx].len,
+            color,
+          });
+        }
+      }
+    }
+
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.t += p.speed * dt;
+      if (p.t >= 1) {
+        particles.splice(i, 1);
+        continue;
+      }
+      const e = edgePaths[p.idx];
+      const pos = e.pathEl.getPointAtLength(p.t * e.len);
+      const c = getCircle(i);
+      c.setAttribute("cx", pos.x);
+      c.setAttribute("cy", pos.y);
+      c.setAttribute("fill", COLORS[p.color]);
+      c.setAttribute("opacity", String(0.35 + 0.55 * Math.sin(Math.PI * p.t)));
+    }
+    // hide unused circles
+    for (let i = particles.length; i < circles.length; i++)
+      circles[i].setAttribute("opacity", "0");
+    requestAnimationFrame(frame);
+  }
+
+  // ------------------------------------------------------------------
+  // LIVE: stats, toggle, ticker, console
+  // ------------------------------------------------------------------
+
+  const $ = (id) => document.getElementById(id);
+  const fmt = (n) => {
+    if (n == null) return "\u2013";
+    if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+    return String(n);
+  };
+
+  let prevSeen = null;
+  let prevTs = null;
+  let emaRate = 0;
+
+  async function pollStats() {
+    try {
+      const r = await fetch("/api/stats", { cache: "no-store" });
+      const d = await r.json();
+      const bsky = d.bsky || {};
+      const ticker = d.ticker || {};
+      const seen = (bsky.seen || 0) + (ticker.lan || 0);
+      const now = Date.now();
+      if (prevSeen !== null && prevTs) {
+        // Clamp at zero: a DO restart can reload older counters, which must
+        // never read as negative throughput.
+        const inst = Math.max(0, seen - prevSeen) / Math.max((now - prevTs) / 1000, 0.5);
+        emaRate = emaRate === 0 ? inst : emaRate * 0.6 + inst * 0.4;
+      }
+      prevSeen = seen;
+      prevTs = now;
+      $("stat-events").textContent = fmt(seen);
+      $("stat-rate").textContent = emaRate < 1 && emaRate > 0 ? emaRate.toFixed(1) : String(Math.round(emaRate));
+
+      // Bluesky particle rate follows the live firehose; LAN follows relay volume.
+      rates.blue = bsky.enabled ? Math.max(2.5, Math.min(emaRate, 40)) : 0.25;
+      rates.green = Math.max(0.7, Math.min(emaRate * 0.6, 30));
+      rates.orange = 0.35;
+
+      // toggle state
+      const cb = $("bsky-toggle");
+      if (document.activeElement !== cb && !cb.dataset.busy) cb.checked = !!bsky.enabled;
+      const lbl = $("bsky-state");
+      lbl.textContent = bsky.enabled
+        ? (bsky.connected ? "Bluesky: connected" : "Bluesky: reconnecting")
+        : "Bluesky: paused";
+      lbl.className = "toggle-label " + (bsky.enabled ? "on" : "off");
+    } catch {
+      /* stats are best-effort */
+    }
+  }
+
+  // ---- Bluesky toggle ----
+
+  const toggleEl = $("bsky-toggle");
+  toggleEl.addEventListener("change", async () => {
+    toggleEl.dataset.busy = "1";
+    toggleEl.disabled = true;
+    try {
+      const r = await fetch("/api/bsky/toggle", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: toggleEl.checked }),
+      });
+      const st = await r.json();
+      toggleEl.checked = !!st.enabled;
+      $("bsky-state").textContent = st.enabled ? "Bluesky: connected" : "Bluesky: paused";
+      $("bsky-state").className = "toggle-label " + (st.enabled ? "on" : "off");
+    } catch {
+      toggleEl.checked = !toggleEl.checked;
+    } finally {
+      toggleEl.disabled = false;
+      delete toggleEl.dataset.busy;
+    }
+  });
+
+  // ---- ticker (WebSocket, SSE fallback) ----
+
+  const tickerList = $("ticker-list");
+
+  function addTicker(ev) {
+    const li = document.createElement("li");
+    const kind = String(ev.kind || "event");
+    const badge = document.createElement("span");
+    badge.className = "badge " + (ev.source === "bluesky" ? "bluesky" : "lan");
+    badge.textContent = kind.slice(0, 18);
+    const txt = document.createElement("span");
+    txt.className = "ticker-text";
+    txt.textContent = String(ev.text || "");
+    txt.title = String(ev.text || "");
+    const ts = document.createElement("span");
+    ts.className = "ticker-ts";
+    ts.textContent = (ev.ts || "").slice(11, 19);
+    li.append(badge, txt, ts);
+    tickerList.prepend(li);
+    while (tickerList.children.length > 40) tickerList.removeChild(tickerList.lastChild);
+  }
+
+  function connectTicker() {
+    let tries = 0;
+    let ws = null;
+    const open = () => {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      ws = new WebSocket(`${proto}//${location.host}/ws`);
+      ws.onmessage = (m) => {
+        try {
+          const d = JSON.parse(m.data);
+          if (d.type === "hello") (d.recent || []).forEach(addTicker);
+          if (d.type === "ticker") (d.events || []).forEach(addTicker);
+        } catch { /* ignore */ }
+      };
+      ws.onclose = () => {
+        tries += 1;
+        if (tries <= 5) setTimeout(open, 1200 * tries);
+        else startSse();
+      };
+      ws.onerror = () => { try { ws.close(); } catch {} };
+    };
+    open();
+  }
+
+  function startSse() {
+    try {
+      const es = new EventSource("/events");
+      es.onmessage = (m) => {
+        try { addTicker(JSON.parse(m.data)); } catch { /* ignore */ }
+      };
+    } catch { /* SSE unavailable */ }
+  }
+
+  connectTicker();
+
+  // ---- rows-in-24h header stat: server-cached aggregate (N tabs cost one
+  // query set), skipped while the tab is hidden, backed off after failures ----
+  let rowsFails = 0;
+  async function pollRows() {
+    if (document.hidden) {
+      setTimeout(pollRows, 30000);
+      return;
+    }
+    try {
+      const r = await fetch("/api/rows", { cache: "no-store" });
+      const d = await r.json();
+      $("stat-rows").textContent = d.rows == null ? "\u2013" : fmt(d.rows);
+      rowsFails = 0;
+    } catch {
+      rowsFails += 1;
+    } finally {
+      setTimeout(pollRows, rowsFails >= 3 ? 600000 : 60000);
+    }
+  }
+
+  // ---- console ----
+
+  const consoleEl = $("console");
+  $("console-btn").addEventListener("click", () => consoleEl.classList.toggle("hidden"));
+  $("console-close").addEventListener("click", () => consoleEl.classList.add("hidden"));
+
+  const CHIPS = [
+    { label: "Likes so far (24h)",
+      sql: "SELECT COUNT(*) AS likes FROM bsky.bsky_like WHERE __ingest_ts >= now() - INTERVAL '1 day'" },
+    { label: "Top post languages (24h)",
+      sql: "SELECT langs, COUNT(*) AS c FROM bsky.bsky_post WHERE langs IS NOT NULL AND __ingest_ts >= now() - INTERVAL '1 day' GROUP BY langs ORDER BY c DESC LIMIT 10" },
+    { label: "Events by type (24h)",
+      sql: "SELECT 'post' AS event_type, COUNT(*) AS c FROM bsky.bsky_post WHERE __ingest_ts >= now() - INTERVAL '1 day' UNION ALL SELECT 'like', COUNT(*) FROM bsky.bsky_like WHERE __ingest_ts >= now() - INTERVAL '1 day' UNION ALL SELECT 'repost', COUNT(*) FROM bsky.bsky_repost WHERE __ingest_ts >= now() - INTERVAL '1 day' UNION ALL SELECT 'follow', COUNT(*) FROM bsky.bsky_follow WHERE __ingest_ts >= now() - INTERVAL '1 day' UNION ALL SELECT 'block', COUNT(*) FROM bsky.bsky_block WHERE __ingest_ts >= now() - INTERVAL '1 day' LIMIT 10" },
+    { label: "Noisiest hosts (24h)",
+      sql: "SELECT host, COUNT(*) AS c FROM homelab.syslog WHERE __ingest_ts >= now() - INTERVAL '1 day' GROUP BY host ORDER BY c DESC LIMIT 10" },
+    { label: "Hottest room (24h)",
+      sql: "SELECT entity_id, MAX(value) AS max_value FROM ha.ha_sensor_readings WHERE entity_id LIKE '%temp%' AND __ingest_ts >= now() - INTERVAL '1 day' GROUP BY entity_id ORDER BY max_value DESC LIMIT 10" },
+    { label: "Lights on (recent)",
+      sql: "SELECT DISTINCT entity_id FROM ha.ha_state_changes WHERE event_type = 'light' AND state = 'on' AND __ingest_ts >= now() - INTERVAL '1 day' LIMIT 20" },
+    { label: "Most-queried domains (24h)",
+      sql: "SELECT COALESCE(json_get_str(fields, 'domain'), json_get_str(json_get_str(fields), 'domain')) AS domain, COUNT(*) AS c FROM homelab.dns_queries WHERE __ingest_ts >= now() - INTERVAL '1 day' GROUP BY domain ORDER BY c DESC LIMIT 10" },
+    { label: "Zone requests by status (1h)",
+      sql: "SELECT \"EdgeResponseStatus\" AS status, COUNT(*) AS c FROM cfzone.http_requests WHERE __ingest_ts >= now() - INTERVAL '1 hour' GROUP BY \"EdgeResponseStatus\" ORDER BY c DESC LIMIT 10" },
+    { label: "Worker events by outcome (1h)",
+      sql: "SELECT \"Outcome\", COUNT(*) AS c FROM cfwork.workers_trace_events WHERE __ingest_ts >= now() - INTERVAL '1 hour' GROUP BY \"Outcome\" ORDER BY c DESC LIMIT 10" },
+    { label: "Show databases",
+      sql: "SHOW DATABASES" },
+    { label: "Show tables in bsky",
+      sql: "SHOW TABLES IN bsky" },
+  ];
+
+  const chipsEl = $("chips");
+  for (const chip of CHIPS) {
+    const b = document.createElement("button");
+    b.className = "chip";
+    b.type = "button";
+    b.textContent = chip.label;
+    b.addEventListener("click", () => {
+      $("sql-input").value = chip.sql;
+      runSql();
+    });
+    chipsEl.appendChild(b);
+  }
+
+  async function runSql() {
+    const q = $("sql-input").value;
+    const out = $("sql-result");
+    const runBtn = $("sql-run");
+    if (!q.trim()) return;
+    runBtn.disabled = true;
+    out.innerHTML = `<div class="sql-empty">running...</div>`;
+    try {
+      const r = await fetch("/api/sql", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: q }),
+      });
+      const d = await r.json();
+      out.innerHTML = "";
+      if (d.success && d.result) {
+        const rows = d.result.rows || [];
+        const schema = d.result.schema || [];
+        const m = d.result.metrics || {};
+        const meta = document.createElement("div");
+        meta.className = "sql-metrics";
+        meta.textContent =
+          `${rows.length} row(s)` +
+          (m.bytes_scanned != null ? ` - ${fmt(m.bytes_scanned)} bytes scanned` : "") +
+          (m.files_scanned != null ? ` - ${m.files_scanned} file(s)` : "");
+        out.appendChild(meta);
+        if (!rows.length) {
+          out.appendChild(Object.assign(document.createElement("div"), { className: "sql-empty", textContent: "no rows" }));
+          return;
+        }
+        const table = document.createElement("table");
+        const thead = document.createElement("thead");
+        const hr = document.createElement("tr");
+        for (const col of schema) {
+          const th = document.createElement("th");
+          th.textContent = col.name;
+          hr.appendChild(th);
+        }
+        if (!schema.length) for (const k of Object.keys(rows[0])) {
+          const th = document.createElement("th");
+          th.textContent = k;
+          hr.appendChild(th);
+        }
+        thead.appendChild(hr);
+        table.appendChild(thead);
+        const tbody = document.createElement("tbody");
+        for (const row of rows.slice(0, 200)) {
+          const tr = document.createElement("tr");
+          const vals = schema.length ? schema.map((c) => row[c.name]) : Object.values(row);
+          for (const v of vals) {
+            const td = document.createElement("td");
+            td.textContent = v == null ? "NULL" : typeof v === "object" ? JSON.stringify(v) : String(v);
+            tr.appendChild(td);
+          }
+          tbody.appendChild(tr);
+        }
+        table.appendChild(tbody);
+        out.appendChild(table);
+      } else {
+        const err = document.createElement("div");
+        const code = d.errors && d.errors[0] && d.errors[0].code;
+        if (code === 503) {
+          err.className = "sql-empty";
+          err.textContent =
+            "Console is waiting for setup: mint the R2 API token and run scripts/setup-basin.sh (docs/DEPLOY.md, Tokens section).";
+        } else {
+          err.className = "sql-error";
+          const msg = (d.errors && d.errors[0] && d.errors[0].message) || "Unknown error";
+          err.textContent = msg + (code ? ` (code ${code})` : "");
+        }
+        out.appendChild(err);
+      }
+    } catch {
+      out.innerHTML = `<div class="sql-error">request failed</div>`;
+    } finally {
+      runBtn.disabled = false;
+    }
+  }
+
+  $("sql-run").addEventListener("click", runSql);
+  $("sql-input").addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+      e.preventDefault();
+      runSql();
+    }
+  });
+
+  // ---- flow map highlight hook (Ask scoping) ----
+
+  // Lit edges stay visible while the rest dim, so clicking a table card in
+  // the Ask panel shows the data path behind it.
+  window.__flowvizHighlight = (cardId) => {
+    document.body.classList.toggle("scoped", Boolean(cardId));
+    for (const e of edgePaths) {
+      const lit = cardId && (e.from === cardId || e.to === cardId);
+      e.pathEl.classList.toggle("edge-lit", Boolean(lit));
+    }
+  };
+
+  // ---- keyboard shortcuts ----
+
+  document.addEventListener("keydown", (e) => {
+    const tag = (e.target && e.target.tagName || "").toLowerCase();
+    if (tag === "textarea" || tag === "input") return;
+    if (e.key === "p") document.body.classList.toggle("presentation");
+    if (e.key === "f") {
+      if (document.fullscreenElement) document.exitFullscreen();
+      else document.documentElement.requestFullscreen().catch(() => {});
+    }
+  });
+
+  // ------------------------------------------------------------------
+  // boot
+  // ------------------------------------------------------------------
+
+  renderColumns();
+  layoutEdges();
+  requestAnimationFrame(frame);
+  // Live re-layout whenever any column scrolls (Tables is the scrollable one)
+  // or the window resizes, so edges and dots always track real card positions.
+  for (const col of columnsEl.children) {
+    col.addEventListener("scroll", scheduleLayout, { passive: true });
+  }
+  window.addEventListener("resize", scheduleLayout);
+  new MutationObserver(() => scheduleLayout())
+    .observe(document.body, { attributes: true, attributeFilter: ["class"] });
+
+  pollStats();
+  setInterval(pollStats, 3000);
+  pollRows();
+})();

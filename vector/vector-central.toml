@@ -1,0 +1,408 @@
+# Central Vector agent for the Basin live data flow demo.
+# Target host: server111 (HTPC, Ubuntu 24.04, 192.168.86.111) - a general
+# homelab host: journald services (incl. the UniFi Network Controller),
+# Docker containers (*arr stack, qbittorrent, gluetun, cloudflared), and the
+# Vector agent for the whole LAN. User-level install: the binary lives in
+# ~/vector, configs in ~/basin-flowviz-vector, data in ~/vector-data.
+#
+# Schema target: Vector 0.60.0 (validated on server111 2026-10-24).
+# Secrets come from the local secrets file, never from this file. Vector
+# 0.57+ disabled ${VAR} env interpolation; the file backend is the
+# sanctioned replacement (docs/reference/configuration/secrets):
+#   [secret.basin] type "file" path /home/ian/basin-flowviz-vector/secrets.json
+#   generated from vector.env by scripts/make-secrets-json.sh, mode 600.
+# Referenced anywhere below as SECRET[basin.<key>]; the JSON keys mirror the
+# legacy env names, lowercased:
+#   mqtt_user / mqtt_password         the vector-bridge HA user credentials
+#   unifi_devices_url / unifi_clients_url  Integration API endpoints on the
+#                     UniFi OS Server console, site-scoped:
+#                     https://192.168.86.111:11443/proxy/network/integration/v1/sites/<siteId>/(devices|clients)?limit=200
+#   unifi_api_key     X-API-KEY value (minted in the console: Settings >
+#                     Control Plane > Integrations > API Keys)
+#   basin_ingest_token  token with Basin Pipelines Send permission
+#   relay_cf_id / relay_cf_secret  Cloudflare Access service token pair for
+#                     the relay route (machines cannot complete OTP)
+#   relay_secret       the Worker /relay bearer secret (defense in depth)
+#   client_salt       per-deployment salt for the dns_queries client hash
+#                     (defeats dictionary reversal of LAN client IPs)
+#
+# NOTE: the only code in this whole LAN pipeline is the inline Lua fan-out
+# hooks below, which turn polled JSON arrays (UniFi / DNS APIs) into one event
+# per item. Everything else is Vector configuration.
+
+data_dir = "/home/ian/vector-data"
+
+[secret.basin]
+type = "file"
+path = "/home/ian/basin-flowviz-vector/secrets.json"
+
+[api]
+enabled = true
+address = "127.0.0.1:8686"
+
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+
+[sources.journald]
+type = "journald"
+# Whole-host journal, including systemd units like the UniFi controller.
+include_units = []
+
+[sources.docker_logs]
+type = "docker_logs"
+# All containers (sonarr, radarr, prowlarr, seerr, qbittorrent, gluetun,
+# cloudflared). Everything lands in the tables; qbittorrent/gluetun are
+# excluded from the browser-facing ticker sample further down.
+retry_backoff_secs = 5
+
+[sources.host_metrics]
+type = "host_metrics"
+scrape_interval_secs = 60
+
+# Remote syslog from UniFi APs and the GL.iNet OpenWrt router.
+# NOTE: UDP 5514 is owned by the UniFi Network Controller's own syslog
+# receiver on this host - Vector must not use it. If you want AP syslog in
+# Basin, repoint the controller's per-device remote-syslog target to
+# 192.168.86.111:5517 and it lands here (the controller's own store loses
+# those logs - owner's call at install time).
+[sources.syslog_udp]
+type = "syslog"
+address = "0.0.0.0:5517"
+mode = "udp"
+
+[sources.syslog_tcp]
+type = "syslog"
+address = "0.0.0.0:5515"
+mode = "tcp"
+
+# Home Assistant state changes published by mqtt_statestream on the HA Pi
+# (Mosquitto addon confirmed running at 192.168.86.109:1883).
+[sources.mqtt_ha]
+type = "mqtt"
+host = "192.168.86.109"
+port = 1883
+topic = "ha/#"
+user = "SECRET[basin.mqtt_user]"
+password = "SECRET[basin.mqtt_password]"
+
+# UniFi Integration API pollers (read-only REST, X-API-KEY, local controller).
+[sources.unifi_devices]
+type = "http_client"
+endpoint = "SECRET[basin.unifi_devices_url]"
+interval_secs = 60
+headers = { "X-API-KEY" = ["SECRET[basin.unifi_api_key]"], "Accept" = ["application/json"] }
+# Self-signed console certificate. Accepted LAN risk (see README security
+# posture); pinning the cert via tls.ca_file is the documented upgrade.
+tls.verify_certificate = false
+
+[sources.unifi_clients]
+type = "http_client"
+endpoint = "SECRET[basin.unifi_clients_url]"
+interval_secs = 60
+headers = { "X-API-KEY" = ["SECRET[basin.unifi_api_key]"], "Accept" = ["application/json"] }
+tls.verify_certificate = false
+
+# House DNS: no source here. The GL.iNet router's logd ships its syslog
+# (including dnsmasq logqueries lines) to syslog_udp below, and the
+# dns_queries transform taps that stream. GL.iNet's AdGuard Home fork
+# keeps its HTTP API locked (no users configured, wizard 403s, panel
+# talks via ubus instead), so the query-log API is unreachable by
+# design; dnsmasq sits upstream of AGH and sees every client query.
+
+# OpenWrt cron pushes (ubus bandwidth JSON via curl).
+[sources.openwrt_push]
+type = "http_server"
+address = "0.0.0.0:8687"
+decoding.codec = "json"
+
+# Per-Pi relay agents (vector-pi.toml ships here over the Vector protocol;
+# the central host's resolvable address is 192.168.86.111).
+[sources.pi_agents]
+type = "vector"
+address = "0.0.0.0:8688"
+
+# Vector watching itself: meta-column for the demo.
+[sources.vector_metrics]
+type = "internal_metrics"
+scrape_interval_secs = 30
+
+# ---------------------------------------------------------------------------
+# Transforms
+# ---------------------------------------------------------------------------
+
+# HA: keep only .../state topics (one per state change); attribute topics are
+# skipped entirely, which is also the privacy control.
+[transforms.ha_parse]
+type = "remap"
+inputs = ["mqtt_ha"]
+source = '''
+parts = split!(.topic, "/")
+if length(parts) != 4 || parts[3] != "state" { abort }
+domain = parts[1]
+raw_text = string!(.message)
+# mqtt_statestream publishes the state as-is: "on", "home", 21.5, ...
+# Only numeric states parse as JSON, so fall back to the raw text.
+raw = parse_json(raw_text) ?? raw_text
+state_text = to_string(raw) ?? encode_json(raw)
+value_num = to_float(raw) ?? null
+. = {
+    "event_id": uuid_v4(),
+    "event_type": domain,
+    "entity_id": join!([domain, parts[2]], "."),
+    "state": state_text,
+    "value": value_num,
+    "unit": null,
+    "attributes": null,
+    "ts": now()
+}
+'''
+
+# journald -> homelab_events union rows
+[transforms.journald_rem]
+type = "remap"
+inputs = ["journald"]
+source = '''
+ts = now()
+if is_timestamp(.timestamp) { ts = .timestamp }
+. = {
+    "event_id": uuid_v4(),
+    "event_type": "syslog",
+    "host": to_string(.host) ?? "server111",
+    "ts": ts,
+    "message": truncate(to_string(.message) ?? "", 2000),
+    "fields": encode_json({ "unit": to_string(.unit) ?? null })
+}
+'''
+
+# Docker containers -> homelab_events union rows (event_type docker_log).
+[transforms.docker_rem]
+type = "remap"
+inputs = ["docker_logs"]
+source = '''
+container = to_string(.container_name) ?? to_string(.container_label.com_docker_compose_service) ?? "docker"
+ts = now()
+if is_timestamp(.timestamp) { ts = .timestamp }
+. = {
+    "event_id": uuid_v4(),
+    "event_type": "docker_log",
+    "host": container,
+    "ts": ts,
+    "message": truncate(to_string(.message) ?? "", 2000),
+    "fields": encode_json({ "image": to_string(.image) ?? null })
+}
+'''
+
+# syslog (UniFi + OpenWrt) -> homelab_events union rows. The hostname check
+# is adjusted at bring-up to whatever the GL.iNet logd actually sends.
+[transforms.syslog_rem]
+type = "remap"
+inputs = ["syslog_udp", "syslog_tcp", "openwrt_push", "pi_agents"]
+source = '''
+# dnsmasq query-lifecycle lines (query/forwarded/reply/cached) carry the
+# client address in cleartext; they live on ONLY in dns_queries (client
+# hashed with a per-deployment salt). Dropping them here keeps the raw
+# syslog table free of per-device DNS metadata (run-2 audit finding).
+if (to_string(.appname) ?? "") == "dnsmasq" { abort }
+hn = to_string(.hostname) ?? to_string(.host) ?? "unknown"
+hnl = downcase(hn)
+event_type = "syslog"
+if starts_with(hnl, "openwrt") || starts_with(hnl, "gl-inet") || starts_with(hnl, "glinet") || starts_with(hnl, "gl") {
+    event_type = "openwrt_log"
+}
+ts = now()
+if is_timestamp(.timestamp) { ts = .timestamp }
+. = {
+    "event_id": uuid_v4(),
+    "event_type": event_type,
+    "host": hn,
+    "ts": ts,
+    "message": truncate(to_string(.message) ?? to_string(.msg) ?? "", 2000),
+    "fields": null
+}
+'''
+
+# host metrics + Vector self-metrics -> log rows with a json payload.
+[transforms.metrics_to_log]
+type = "metric_to_log"
+inputs = ["host_metrics", "vector_metrics"]
+
+[transforms.metrics_rem]
+type = "remap"
+inputs = ["metrics_to_log"]
+source = '''
+ts = now()
+if is_timestamp(.timestamp) { ts = .timestamp }
+. = {
+    "event_id": uuid_v4(),
+    "event_type": "host_metrics",
+    "host": to_string(.host) ?? "server111",
+    "ts": ts,
+    "message": null,
+    "fields": encode_json({
+        "name": to_string(.name) ?? null,
+        "kind": to_string(.kind) ?? null,
+        "value": .value,
+        "tags": .tags
+    })
+}
+'''
+
+# UniFi pollers: parse the JSON response page and unwrap the data array
+# (the Integration API returns {offset, limit, count, totalCount, data: [...]}).
+[transforms.unifi_devices_parse]
+type = "remap"
+inputs = ["unifi_devices"]
+source = '''
+t = parse_json!(string!(.message))
+if is_object(t) && exists(t.data) { t = t.data }
+.body = t
+'''
+
+[transforms.unifi_devices_rem]
+type = "remap"
+inputs = ["unifi_devices_parse"]
+source = '''
+. = {
+    "event_id": uuid_v4(),
+    "event_type": "unifi_devices",
+    "host": "unifi",
+    "ts": now(),
+    "message": null,
+    "fields": encode_json(.)
+}
+'''
+
+[transforms.unifi_clients_parse]
+type = "remap"
+inputs = ["unifi_clients"]
+source = '''
+t = parse_json!(string!(.message))
+if is_object(t) && exists(t.data) { t = t.data }
+.body = t
+'''
+
+[transforms.unifi_clients_rem]
+type = "remap"
+inputs = ["unifi_clients_parse"]
+source = '''
+. = {
+    "event_id": uuid_v4(),
+    "event_type": "unifi_clients",
+    "host": "unifi",
+    "ts": now(),
+    "message": null,
+    "fields": encode_json(.)
+}
+'''
+
+# House DNS: one event per dnsmasq query[...] line from the router syslog.
+# Line shape (captured 2026-10-24, dnsmasq on GL-AXT1800):
+#   278 192.168.86.183/19741 query[AAAA] api.fe.amazonalexa.com from 192.168.86.183
+# The seq + client/port prefix is optional so other dnsmasq builds still
+# parse. forwarded/reply/cached lines simply do not match and drop out of
+# the DNS stream (they still reach the homelab syslog rows via syslog_rem).
+# Client IPs are hashed with a per-deployment salt (salting defeats the
+# trivial /24 dictionary attack on raw client hashes - run-2 finding).
+# dnsmasq sits upstream of AdGuard Home, so there is no blocked flag: the
+# card shows query volume (README documents this trade-off).
+[transforms.dns_queries]
+type = "remap"
+inputs = ["syslog_udp", "syslog_tcp"]
+source = '''
+if (to_string(.appname) ?? "") != "dnsmasq" { abort }
+m, err = parse_regex(to_string(.message) ?? "", r'^(?:\d+ )?(?:\S+/\d+ )?query\[(?P<qtype>[^\]]+)\] (?P<domain>\S+) from (?P<client>\S+)$')
+if err != null { abort }
+. = {
+    "event_id": uuid_v4(),
+    "event_type": "dns_queries",
+    "host": "dns",
+    "ts": now(),
+    "message": null,
+    "fields": {
+        "domain": m.domain,
+        "client_hash": sha2!(string!(m.client) + "SECRET[basin.client_salt]"),
+        "query_type": m.qtype
+    }
+}
+'''
+
+# Browser-ticker view of docker events: qbittorrent/gluetun excluded (all
+# containers still flow to the tables via homelab_basin below).
+[transforms.docker_ticker_filter]
+type = "filter"
+inputs = ["docker_rem"]
+condition = '.host != "qbittorrent" && .host != "gluetun"'
+
+# Ticker relay: sanitized sample -> Worker /relay -> TickerHub -> browsers.
+# The sanitize transform is the privacy gate for the browser-facing plane; it
+# must stay between the sources and the relay sink.
+[transforms.relay_sample]
+type = "sample"
+inputs = ["ha_parse", "journald_rem", "docker_ticker_filter", "syslog_rem", "metrics_rem", "unifi_devices_rem", "unifi_clients_rem", "dns_queries"]
+rate = 5
+
+[transforms.relay_sanitize]
+type = "remap"
+inputs = ["relay_sample"]
+source = '''
+kind = to_string(.event_type) ?? "event"
+# Browser-facing ticker text: HA events show entity -> state; everything else
+# shows only the kind (syslog/journald/docker message bodies stay table-only;
+# input_text values are user-authored free text, so they never reach the
+# ticker either). Redact IPv4/MAC defensively regardless.
+text = kind
+if kind == "light" || kind == "switch" || kind == "binary_sensor" || kind == "climate" || kind == "media_player" || kind == "sensor" {
+    text = join([to_string(.entity_id) ?? "", "->", to_string(.state) ?? ""], " ")
+}
+text = replace(text, r'\b(?:\d{1,3}\.){3}\d{1,3}\b', "[redacted]")
+text = replace(text, r'\b[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}\b', "[redacted]")
+. = {
+    "source": "lan",
+    "kind": kind,
+    "text": truncate(text, 90),
+    "ts": now()
+}
+'''
+
+# ---------------------------------------------------------------------------
+# Sinks
+# ---------------------------------------------------------------------------
+
+# Basin Pipelines HTTP ingest. One event per request: the endpoint accepts a
+# bare JSON object and wraps it into an array server-side.
+[sinks.ha_basin]
+type = "http"
+inputs = ["ha_parse"]
+uri = "https://249e210513e04c56b5df9fd83707690c.ingest.cloudflare.com"
+encoding.codec = "json"
+batch.max_events = 1
+batch.timeout_secs = 1
+request.headers.Authorization = "Bearer SECRET[basin.basin_ingest_token]"
+request.concurrency = "adaptive"
+healthcheck.enabled = false
+
+[sinks.homelab_basin]
+type = "http"
+inputs = ["journald_rem", "docker_rem", "syslog_rem", "metrics_rem", "unifi_devices_rem", "unifi_clients_rem", "dns_queries"]
+uri = "https://578aef7b6d5b4ad6980dcdc79456da4a.ingest.cloudflare.com"
+encoding.codec = "json"
+batch.max_events = 1
+batch.timeout_secs = 1
+request.headers.Authorization = "Bearer SECRET[basin.basin_ingest_token]"
+request.concurrency = "adaptive"
+healthcheck.enabled = false
+
+[sinks.relay]
+type = "http"
+inputs = ["relay_sanitize"]
+uri = "https://logs.ihogben.com/relay"
+encoding.codec = "json"
+framing.method = "newline_delimited"
+batch.max_events = 20
+batch.timeout_secs = 2
+request.headers.Authorization = "Bearer SECRET[basin.relay_secret]"
+request.headers.CF-Access-Client-Id = "SECRET[basin.relay_cf_id]"
+request.headers.CF-Access-Client-Secret = "SECRET[basin.relay_cf_secret]"
+request.concurrency = "adaptive"
+healthcheck.enabled = false

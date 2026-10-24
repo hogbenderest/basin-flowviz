@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Basin: live data flow</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">
+    <span class="logo">&#9650;</span>
+    <span class="brand-name">Basin</span>
+    <span class="brand-sub">live data flow</span>
+  </div>
+  <div class="stats">
+    <div class="stat"><span class="stat-value" id="stat-rate">0</span><span class="stat-label">events/s</span></div>
+    <div class="stat"><span class="stat-value" id="stat-events">0</span><span class="stat-label">events seen</span></div>
+    <div class="stat"><span class="stat-value" id="stat-rows">&ndash;</span><span class="stat-label">rows (24h)</span></div>
+    <div class="stat zero"><span class="stat-value">0</span><span class="stat-label">Kafka</span></div>
+    <div class="stat zero"><span class="stat-value">0</span><span class="stat-label">Flink</span></div>
+    <div class="stat zero"><span class="stat-value">0</span><span class="stat-label">data warehouses</span></div>
+  </div>
+  <div class="header-right">
+    <div class="bsky-toggle">
+      <span class="toggle-label" id="bsky-state">Bluesky: paused</span>
+      <label class="switch" title="Toggle the Bluesky firehose ingest">
+        <input type="checkbox" id="bsky-toggle" />
+        <span class="slider"></span>
+      </label>
+    </div>
+    <button id="inbox-btn" class="btn" type="button">Investigations</button>
+    <button id="console-btn" class="btn" type="button">SQL console</button>
+  </div>
+</header>
+
+<div id="askbar">
+  <span class="askbar-label">Ask</span>
+  <input id="ask-input" type="text" placeholder="ask the archive: which domains were queried most today? who's generating DNS traffic tonight?" autocomplete="off" spellcheck="false" />
+  <button id="ask-submit" class="btn primary" type="button">Ask</button>
+  <button id="askbar-toggle" class="btn small" type="button" title="toggle the answer panel">panel</button>
+  <div id="ask-note" class="hidden"></div>
+</div>
+
+<main id="flow">
+  <svg id="edges" aria-hidden="true"></svg>
+  <div class="columns" id="columns"></div>
+</main>
+
+<footer id="ticker">
+  <div class="ticker-title">live events</div>
+  <ul id="ticker-list"></ul>
+</footer>
+
+<div id="console" class="hidden">
+  <div class="console-head">
+    <span class="console-title">Basin SQL console</span>
+    <button id="console-close" class="btn small" type="button">close</button>
+  </div>
+  <div class="chips" id="chips"></div>
+  <textarea id="sql-input" spellcheck="false"
+    placeholder="SELECT ... (read-only, forced LIMIT 200, 30s cap)"></textarea>
+  <div class="console-actions">
+    <button id="sql-run" class="btn primary" type="button">Run</button>
+    <span class="console-hint">server enforces read-only; keep WHERE time bounds to control cost</span>
+  </div>
+  <div id="sql-result" class="sql-result"></div>
+</div>
+
+<div id="ask-panel" class="hidden">
+  <div class="console-head">
+    <span class="console-title">Ask the archive</span>
+    <button id="ask-close" class="btn small" type="button">close</button>
+  </div>
+  <div class="chips" id="ask-chips"></div>
+  <div id="ask-session"></div>
+  <div id="ask-body"></div>
+</div>
+
+<div id="inbox" class="hidden">
+  <div class="console-head">
+    <span class="console-title">Investigations</span>
+    <button id="inbox-close" class="btn small" type="button">close</button>
+  </div>
+  <div id="inbox-list"></div>
+  <div id="inbox-report" class="hidden"></div>
+</div>
+
+<script src="/app.js"></script>
+<script src="/vendor/echarts.min.js"></script>
+<script src="/charts.js"></script>
+<script src="/ask.js"></script>
+</body>
+</html>

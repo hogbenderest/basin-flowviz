@@ -1,0 +1,14 @@
+{
+  "fields": [
+    { "name": "event_id", "type": "string", "required": true },
+    { "name": "event_type", "type": "string", "required": true },
+    { "name": "did", "type": "string", "required": false },
+    { "name": "operation", "type": "string", "required": false },
+    { "name": "event_time", "type": "timestamp", "required": false },
+    { "name": "created_at", "type": "string", "required": false },
+    { "name": "text", "type": "string", "required": false },
+    { "name": "langs", "type": "string", "required": false },
+    { "name": "subject_uri", "type": "string", "required": false },
+    { "name": "subject_did", "type": "string", "required": false }
+  ]
+}

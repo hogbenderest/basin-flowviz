@@ -1,0 +1,12 @@
+{
+  "fields": [
+    { "name": "event_id", "type": "string", "required": true },
+    { "name": "event_type", "type": "string", "required": true },
+    { "name": "entity_id", "type": "string", "required": false },
+    { "name": "state", "type": "string", "required": false },
+    { "name": "value", "type": "float64", "required": false },
+    { "name": "unit", "type": "string", "required": false },
+    { "name": "attributes", "type": "json", "required": false },
+    { "name": "ts", "type": "timestamp", "required": true }
+  ]
+}

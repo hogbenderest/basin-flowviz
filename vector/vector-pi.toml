@@ -1,0 +1,30 @@
+# Per-Pi relay agent for the Basin live data flow demo.
+# Runs on each Raspberry Pi (other than the HA Pi). Ships its journald to the
+# central agent on server111 over the Vector protocol.
+#
+# Set VECTOR_HOST to a unique name per Pi, for example pi-hole, pi-2.
+#   VECTOR_HOST=pi-hole vector --config vector-pi.toml
+# Validate before first run: vector validate vector-pi.toml
+
+data_dir = "/var/lib/vector"
+
+[sources.journald]
+type = "journald"
+
+[transforms.tag_host]
+type = "remap"
+inputs = ["journald"]
+source = '.host = get_env_var!("VECTOR_HOST")'
+
+[sinks.central]
+type = "vector"
+inputs = ["tag_host"]
+address = "http://server111:8688"
+
+# Notes:
+# - host_metrics from Pis is skipped in v1 to keep the relay simple; the
+#   central agent could add a prometheus_scrape of node_exporter later,
+#   or Pi agents can grow a host_metrics source feeding their own vector
+#   sink.
+# - Pi Zero-class devices can use rsyslog forwarding to server111:5515
+#   instead of running Vector at all.

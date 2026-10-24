@@ -1,0 +1,68 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "basin-flowviz",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-18",
+  // The public URL is logs.ihogben.com behind a Cloudflare Access
+  // application (OTP, allowed email domains). workers.dev is disabled:
+  // Access cannot gate a workers.dev hostname (Cloudflare's zone, not ours).
+  "workers_dev": false,
+  "routes": [
+    {
+      "pattern": "logs.ihogben.com",
+      "custom_domain": true,
+      "zone_name": "ihogben.com"
+    }
+  ],
+  // Ship this Worker's own logs into the workers_trace_events Logpush column.
+  // Never console.log secrets, tokens, or raw request bodies.
+  "logpush": true,
+  "assets": {
+    "directory": "public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*", "/ws", "/events", "/relay"]
+  },
+  "pipelines": [
+    {
+      "binding": "BSKY_STREAM",
+      "stream": "2c8498f59e454781b62ddfcd83b88c63"
+    }
+  ],
+  "ai": { "binding": "AI" },
+  "d1_databases": [
+    {
+      "binding": "REPORTS_D1",
+      "database_name": "flowviz_reports",
+      "database_id": "6b46f906-4817-4b09-839c-df5256090895",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [{ "binding": "REPORTS_R2", "bucket_name": "flowviz-reports" }],
+  "workflows": [
+    {
+      "name": "investigation",
+      "binding": "INVESTIGATIONS",
+      "class_name": "InvestigationWorkflow"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "JETSTREAM", "class_name": "JetstreamConsumer" },
+      { "name": "TICKER", "class_name": "TickerHub" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["JetstreamConsumer", "TickerHub"] }
+  ],
+  "triggers": {
+    "crons": ["*/2 * * * *", "*/5 * * * *"]
+  },
+  "observability": { "enabled": true },
+  "vars": {
+    "ACCOUNT_ID": "48f5cc18f1a716e781d39f1d6777ddc9",
+    "BUCKET": "basin-demo",
+    "ASK_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "SCAN_BUDGET_MB": "2048",
+    "ASK_PER_MINUTE": "10"
+  }
+}
