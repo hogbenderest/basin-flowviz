@@ -29,11 +29,15 @@ import type { TickerEvent } from "./ticker";
 import {
   sanitizeSql,
   runSql,
+  runSqlJson,
   MAX_QUERY_CHARS,
 } from "./sql";
 import type { SqlEnv } from "./sql";
 import { handleAsk, handleCatalog, handleEvidenceRows, userOf } from "./ask/handlers";
 import { runDetectors, runDriftCheck, type SchedulerEnv } from "./investigate/detectors";
+import { checkBudget, recordScan } from "./query/service";
+import { getHeaderStats, runHeaderCollectors } from "./stats/collectors";
+import type { ServiceEnv } from "./bindings";
 
 export { JetstreamConsumer, TickerHub };
 export { InvestigationWorkflow } from "./investigate/workflow";
@@ -267,6 +271,7 @@ const ROW_QUERIES = [
   "SELECT COUNT(*) AS c FROM bsky.bsky_post WHERE __ingest_ts >= now() - INTERVAL '1 day'",
   "SELECT COUNT(*) AS c FROM ha.ha_state_changes WHERE __ingest_ts >= now() - INTERVAL '1 day'",
   "SELECT COUNT(*) AS c FROM homelab.syslog WHERE __ingest_ts >= now() - INTERVAL '1 day'",
+  "SELECT COUNT(*) AS c FROM homelab.host_metrics WHERE __ingest_ts >= now() - INTERVAL '1 day'",
 ];
 const ROWS_TTL_MS = 60_000;
 
@@ -417,6 +422,22 @@ async function handleScenario(env: Env, req: Request): Promise<Response> {
 // Worker entry
 // ---------------------------------------------------------------------------
 
+// Header stats change at most every 15 min, but /api/stats is polled
+// every ~3 s per tab: cache the D1 reads for 30 s per isolate.
+let headerStatsCache: {
+  at: number;
+  value: Awaited<ReturnType<typeof getHeaderStats>>;
+} | null = null;
+async function headerStatsCached(env: Env) {
+  if (!headerStatsCache || Date.now() - headerStatsCache.at > 30_000) {
+    headerStatsCache = {
+      at: Date.now(),
+      value: await getHeaderStats(env as unknown as ServiceEnv).catch(() => null),
+    };
+  }
+  return headerStatsCache.value;
+}
+
 export default {
   async fetch(req: Request, env: Env, ctx: Ctx): Promise<Response> {
     const url = new URL(req.url);
@@ -452,12 +473,13 @@ export default {
     }
 
     if (path === "/api/stats" && req.method === "GET") {
-      const [bsky, ticker] = await Promise.all([
+      const [bsky, ticker, header] = await Promise.all([
         jet(env).getStats(),
         hub(env).getStats(),
+        headerStatsCached(env),
       ]);
       return Response.json(
-        { bsky, ticker, ts: Date.now() },
+        { bsky, ticker, header, ts: Date.now() },
         {
           headers: {
             "Cache-Control": "no-store",
@@ -530,8 +552,39 @@ export default {
           { status: 400 },
         );
       }
+      // Console queries participate in the per-user scan budget and the
+      // cost records (run-3 review B6+M2): buffer the response so
+      // bytes_scanned can be recorded, then hand the same JSON shape
+      // back to the browser.
+      const user = userOf(req);
       try {
-        return await runSql(env, check.query);
+        await checkBudget(env as unknown as ServiceEnv, user);
+      } catch {
+        return Response.json(
+          {
+            success: false,
+            errors: [{ code: 429, message: "Daily scan budget exhausted." }],
+          },
+          { status: 429 },
+        );
+      }
+      try {
+        const d = await runSqlJson(env, check.query);
+        const bytes = Number(d?.result?.metrics?.bytes_scanned ?? 0);
+        if (bytes > 0) {
+          await recordScan(
+            env as unknown as ServiceEnv,
+            user,
+            new Date().toISOString().slice(0, 10),
+            bytes,
+          ).catch(() => {});
+        }
+        return Response.json(d, {
+          headers: {
+            "Cache-Control": "no-store",
+            "Cross-Origin-Resource-Policy": "same-site",
+          },
+        });
       } catch {
         return Response.json(
           {
@@ -654,6 +707,11 @@ export default {
           });
           await runDriftCheck(schedulerEnv(env)).catch((e) => {
             console.error("drift check failed", e instanceof Error ? e.message : String(e));
+          });
+          // Header-stat collectors (W2/W3): freshness every 15 min,
+          // compression + cost/day hourly; internally gated.
+          await runHeaderCollectors(schedulerEnv(env)).catch((e) => {
+            console.error("header collectors failed", e instanceof Error ? e.message : String(e));
           });
         })(),
       );

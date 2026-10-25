@@ -8,6 +8,7 @@ import { renderForModel } from "../catalog/render";
 import type { QueryPlan, AskState } from "../catalog/types";
 import { ALLOWED_ARCHETYPES } from "../catalog/validate";
 import type { ServiceEnv } from "../bindings";
+import { recordAiUsage } from "../stats/collectors";
 
 export interface PlanSession {
   tableScope?: string;
@@ -253,6 +254,8 @@ async function callModel(
       max_tokens: maxTokens,
       temperature: 0.2,
     });
+    // Cost capture (W3): record the usage block when the envelope has it.
+    await recordAiUsage(env, model(env), out);
     const text = extractModelText(out);
     if (!text) {
       // Surface the service's own error fields for diagnosis; logpush ships
@@ -410,6 +413,7 @@ export async function narrateAnswer(
       max_tokens: 220,
       temperature: 0.2,
     })) as { response?: string } | null;
+    await recordAiUsage(env, model(env), out);
     const text = extractModelText(out);
     if (text) {
       const parsed = extractJson(text) as { answer?: string } | null;

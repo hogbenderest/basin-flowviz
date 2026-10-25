@@ -15,11 +15,10 @@
   </div>
   <div class="stats">
     <div class="stat"><span class="stat-value" id="stat-rate">0</span><span class="stat-label">events/s</span></div>
-    <div class="stat"><span class="stat-value" id="stat-events">0</span><span class="stat-label">events seen</span></div>
     <div class="stat"><span class="stat-value" id="stat-rows">&ndash;</span><span class="stat-label">rows (24h)</span></div>
-    <div class="stat zero"><span class="stat-value">0</span><span class="stat-label">Kafka</span></div>
-    <div class="stat zero"><span class="stat-value">0</span><span class="stat-label">Flink</span></div>
-    <div class="stat zero"><span class="stat-value">0</span><span class="stat-label">data warehouses</span></div>
+    <div class="stat" id="stat-fresh-box" title="age of the newest row in the core tables"><span class="stat-value" id="stat-fresh">&ndash;</span><span class="stat-label">ingest freshness</span></div>
+    <div class="stat" id="stat-cost-box" title="estimated daily cost"><span class="stat-value" id="stat-cost">&ndash;</span><span class="stat-label">cost/day (est)</span></div>
+    <div class="stat" id="stat-byterow-box" title="compressed bytes per row, from Iceberg snapshot metadata (no scans)"><span class="stat-value" id="stat-byterow">&ndash;</span><span class="stat-label">compressed B/row</span></div>
   </div>
   <div class="header-right">
     <div class="bsky-toggle">
@@ -29,7 +28,7 @@
         <span class="slider"></span>
       </label>
     </div>
-    <button id="inbox-btn" class="btn" type="button">Investigations</button>
+    <button id="inbox-btn" class="btn" type="button">Investigations<span id="inbox-badge" class="hidden"></span></button>
     <button id="console-btn" class="btn" type="button">SQL console</button>
   </div>
 </header>
@@ -48,6 +47,7 @@
 </main>
 
 <footer id="ticker">
+  <div class="ticker-handle" id="ticker-handle" title="drag to resize; double-click to expand"></div>
   <div class="ticker-title">live events</div>
   <ul id="ticker-list"></ul>
 </footer>

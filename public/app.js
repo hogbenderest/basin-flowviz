@@ -89,14 +89,14 @@
         { name: "included with Basin", cards: [
           { id: "e_sql", label: "Basin SQL", sub: "REST - live; used by this console", cls: "engine primary" },
         ]},
-        { name: "direct interop (Iceberg REST)", cards: [
+        { name: "direct interop (Iceberg REST)", note: "Open Iceberg tables: any compatible engine can read them via Basin Catalog. Not connected in this deployment.", cards: [
           { id: "e_duck", label: "DuckDB", sub: "reads via Basin Catalog", cls: "engine" },
           { id: "e_trino", label: "Trino", sub: "reads via Basin Catalog", cls: "engine" },
           { id: "e_snow", label: "Snowflake", sub: "via Basin Catalog; its compute billed separately", cls: "engine" },
           { id: "e_spark", label: "Apache Spark", sub: "PyIceberg interop", cls: "engine" },
           { id: "e_pyspark", label: "PySpark", sub: "writes to existing tables", cls: "engine" },
         ]},
-        { name: "existing BI investments", cards: [
+        { name: "existing BI investments", note: "Keeps its existing connectors, pointed at the engines above. Not connected in this deployment.", cards: [
           { id: "e_tableau", label: "Tableau", sub: "keeps its connector; points it at Trino/Snowflake", cls: "engine" },
           { id: "e_qlik", label: "Qlik", sub: "via Trino / ODBC", cls: "engine" },
           { id: "e_powerbi", label: "Power BI", sub: "via Snowflake connector", cls: "engine" },
@@ -172,6 +172,16 @@
             new CustomEvent("flowviz:card", { detail: { id: c.id, label: c.label } }),
           );
         });
+        // W6: hovering a card brightens its edges; static interop edges
+        // become visible invitations instead of fake ambient flow.
+        el.addEventListener("mouseenter", () => {
+          for (const e of edgePaths)
+            if (e.to === c.id || e.from === c.id) e.pathEl.classList.add("edge-hover");
+        });
+        el.addEventListener("mouseleave", () => {
+          for (const e of edgePaths)
+            if (e.to === c.id || e.from === c.id) e.pathEl.classList.remove("edge-hover");
+        });
         colEl.appendChild(el);
       };
       if (col.groups) {
@@ -180,6 +190,12 @@
           gh.className = "group";
           gh.textContent = g.name;
           colEl.appendChild(gh);
+          if (g.note) {
+            const gn = document.createElement("div");
+            gn.className = "group-note";
+            gn.textContent = g.note;
+            colEl.appendChild(gn);
+          }
           for (const c of g.cards) addCard(c);
         }
       } else if (col.cards) {
@@ -255,6 +271,7 @@
     green: "#2fd48f",
     orange: "#f6821f",
     dim: "#7a5a36",
+    query: "#f6a54e",
   };
   const circles = [];
 
@@ -269,8 +286,12 @@
     return circles[i];
   }
 
-  let rates = { blue: 0.4, green: 0.9, orange: 0.35, dim: 0.5 }; // particles/sec per color (ambient)
-  const TARGET_CAP = { blue: 42, green: 60, orange: 26, dim: 34 };
+  // Ambient rates cover the real live sources only. The "dim" edges
+  // (query path, interop, BI) get NO ambient particles (run-3 review W6):
+  // they brighten on hover, and the Basin SQL edges pulse only when a
+  // real query actually runs (pulseSqlEdges below).
+  let rates = { blue: 0.4, green: 0.9, orange: 0.35 }; // particles/sec per color (ambient)
+  const TARGET_CAP = { blue: 42, green: 60, orange: 26 };
   const liveCounts = { blue: 0, green: 0, orange: 0, dim: 0 };
 
   function countLive(color) {
@@ -325,6 +346,25 @@
     requestAnimationFrame(frame);
   }
 
+  // Real query pulses (run-3 W3/W6): one-shot particles along the
+  // table -> Basin SQL edges when a query actually runs. Particles on
+  // this map always mean real events.
+  function pulseSqlEdges(fromCards) {
+    const pool = edgePaths
+      .map((e, i) =>
+        e.to === "e_sql" && (!fromCards || fromCards.includes(e.from)) ? i : -1)
+      .filter((i) => i >= 0);
+    for (const idx of pool) {
+      particles.push({
+        idx,
+        t: Math.random() * 0.35, // stagger so the burst reads as a sweep
+        speed: (200 + Math.random() * 90) / edgePaths[idx].len,
+        color: "query",
+      });
+    }
+  }
+  window.__flowvizQueryPulse = (cardIds) => pulseSqlEdges(cardIds);
+
   // ------------------------------------------------------------------
   // LIVE: stats, toggle, ticker, console
   // ------------------------------------------------------------------
@@ -337,6 +377,9 @@
     if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
     return String(n);
   };
+
+  const fmtAge = (s) => (s >= 90 ? Math.round(s / 60) + "m" : Math.round(s) + "s");
+  const usd4 = (v) => (v == null ? "n/a" : "$" + v.toFixed(4));
 
   let prevSeen = null;
   let prevTs = null;
@@ -358,7 +401,6 @@
       }
       prevSeen = seen;
       prevTs = now;
-      $("stat-events").textContent = fmt(seen);
       $("stat-rate").textContent = emaRate < 1 && emaRate > 0 ? emaRate.toFixed(1) : String(Math.round(emaRate));
 
       // Bluesky particle rate follows the live firehose; LAN follows relay volume.
@@ -374,6 +416,66 @@
         ? (bsky.connected ? "Bluesky: connected" : "Bluesky: reconnecting")
         : "Bluesky: paused";
       lbl.className = "toggle-label " + (bsky.enabled ? "on" : "off");
+
+      // Header stats (W3): freshness, cost/day, compressed bytes/row and
+      // the investigations unread badge. Server-computed; this renders.
+      const h = d.header || {};
+      if (h.freshness) {
+        const age = h.freshness.worstAgeSec;
+        const el = $("stat-fresh");
+        if (el) {
+          el.textContent = age == null ? "--" : fmtAge(age);
+          el.classList.remove("fresh-warn", "fresh-bad");
+          if (age != null) {
+            if (age > 600) el.classList.add("fresh-bad");
+            else if (age > 300) el.classList.add("fresh-warn");
+          }
+          const per = Object.entries(h.freshness.perTable || {})
+            .map(([id, a]) => `${id}: ${a == null ? "no rows in the last hour" : fmtAge(a)}`)
+            .join("\n");
+          $("stat-fresh-box").title = per + "\n(newest-row age, probed every 15 min)";
+        }
+      }
+      if (h.cost) {
+        const el = $("stat-cost");
+        if (el) {
+          el.textContent =
+            h.cost.perDayUsd == null
+              ? "--"
+              : "$" +
+                (h.cost.perDayUsd < 0.01
+                  ? h.cost.perDayUsd.toFixed(4)
+                  : h.cost.perDayUsd.toFixed(2));
+          const b = h.cost.breakdown || {};
+          $("stat-cost-box").title =
+            `Basin SQL scans: ${usd4(b.scan.usdPerDay)} (${fmt(b.scan.avgBytesPerDay)} B/day avg; $0.0025/GB, first 10 GB/mo free)\n` +
+            `Workers AI: ${usd4(b.ai.usdPerDay)} (${Math.round(b.ai.avgNeuronsPerDay || 0)} neurons/day avg; 10k/day free)\n` +
+            `R2 storage: ${usd4(b.storage.usdPerDay)} (${fmt(b.storage.bytesPerDay)} B/day growth; $0.015/GB-mo)\n` +
+            `trailing 7-day averages; no clusters, no idle capacity`;
+        }
+      }
+      if (h.compression) {
+        const el = $("stat-byterow");
+        if (el) {
+          el.textContent =
+            h.compression.bytesPerRow == null
+              ? "--"
+              : Math.round(h.compression.bytesPerRow) + " B";
+          const pt = Object.entries(h.compression.perTable || {})
+            .map(([id, s]) => `${id}: ${s.bytesPerRow == null ? "n/a" : Math.round(s.bytesPerRow) + " B/row"}`)
+            .join("\n");
+          $("stat-byterow-box").title = pt + "\n(Iceberg snapshot metadata; zero scanned bytes)";
+        }
+      }
+      if (h.unread != null) {
+        const badge = $("inbox-badge");
+        if (badge) {
+          if (h.unread > 0) {
+            badge.textContent = String(Math.min(h.unread, 99));
+            badge.classList.remove("hidden");
+          } else badge.classList.add("hidden");
+        }
+      }
     } catch {
       /* stats are best-effort */
     }
@@ -459,6 +561,54 @@
 
   connectTicker();
 
+  // ---- ticker resize (W5): drag the handle; double-click snaps ----
+  const tickerHandle = $("ticker-handle");
+  if (tickerHandle) {
+    const applyTickerH = (h) => {
+      const v = Math.max(
+        96,
+        Math.min(Math.round(window.innerHeight * 0.8), Math.round(h)),
+      );
+      document.documentElement.style.setProperty("--ticker-h", v + "px");
+      try {
+        localStorage.setItem("ticker-h", String(v));
+      } catch {}
+      scheduleLayout();
+    };
+    try {
+      const saved = parseInt(localStorage.getItem("ticker-h") || "", 10);
+      if (Number.isFinite(saved) && saved >= 96)
+        document.documentElement.style.setProperty("--ticker-h", saved + "px");
+    } catch {}
+    let dragging = false;
+    tickerHandle.addEventListener("pointerdown", (e) => {
+      dragging = true;
+      tickerHandle.classList.add("dragging");
+      tickerHandle.setPointerCapture(e.pointerId);
+      e.preventDefault();
+    });
+    tickerHandle.addEventListener("pointermove", (e) => {
+      if (!dragging) return;
+      applyTickerH(window.innerHeight - e.clientY);
+    });
+    const endDrag = () => {
+      if (!dragging) return;
+      dragging = false;
+      tickerHandle.classList.remove("dragging");
+    };
+    tickerHandle.addEventListener("pointerup", endDrag);
+    tickerHandle.addEventListener("pointercancel", endDrag);
+    // Double-click: compact (150px) <-> expanded (~half viewport).
+    // Presentation mode keeps its own 96px via CSS specificity.
+    tickerHandle.addEventListener("dblclick", () => {
+      const cur = parseInt(
+        (getComputedStyle(document.documentElement).getPropertyValue("--ticker-h") || "150").trim(),
+        10,
+      );
+      applyTickerH(Number.isFinite(cur) && cur > 200 ? 150 : window.innerHeight * 0.5);
+    });
+  }
+
   // ---- rows-in-24h header stat: server-cached aggregate (N tabs cost one
   // query set), skipped while the tab is hidden, backed off after failures ----
   let rowsFails = 0;
@@ -537,6 +687,10 @@
         body: JSON.stringify({ query: q }),
       });
       const d = await r.json();
+      if (d && d.success && window.__flowvizQueryPulse) {
+        // A real query just ran: sweep the table -> Basin SQL edges.
+        window.__flowvizQueryPulse(null);
+      }
       out.innerHTML = "";
       if (d.success && d.result) {
         const rows = d.result.rows || [];

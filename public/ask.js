@@ -21,6 +21,9 @@ window.FlowvizAsk = (() => {
     t_wt: "cfwork.workers_trace_events",
   };
 
+  const TABLE_TO_CARD = {};
+  for (const [card, table] of Object.entries(CARD_TO_TABLE)) TABLE_TO_CARD[table] = card;
+
   const session = { tableScope: null, fromUTC: null, toUTC: null, lineage: [] };
   let catalogData = null;
   let lastSelection = null;
@@ -228,6 +231,13 @@ window.FlowvizAsk = (() => {
       renderNotes(d.notes || [], out);
       renderEvidence(d.evidence || [], out);
       return;
+    }
+
+    // A real governed query just ran: pulse the flow map's query edges
+    // for the primary table (run-3 W3/W6: particles mean real events).
+    if (window.__flowvizQueryPulse && (d.state === "answered" || d.state === "scenario")) {
+      const t = d.plan && d.plan.table;
+      window.__flowvizQueryPulse(t && TABLE_TO_CARD[t] ? [TABLE_TO_CARD[t]] : null);
     }
 
     if (d.answer) {

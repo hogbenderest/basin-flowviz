@@ -11,6 +11,7 @@ import { catalog } from "../catalog/render";
 import type { EvidenceRecord, Finding, InvestigationReport } from "../catalog/types";
 import type { SchedulerEnv } from "./detectors";
 import { extractModelText } from "../ask/planner";
+import { recordAiUsage } from "../stats/collectors";
 
 export interface DnsVolumeParams {
   detectorId: string;
@@ -290,6 +291,7 @@ async function synthesize(
       max_tokens: 700,
       temperature: 0.2,
     })) as unknown;
+    await recordAiUsage(env, env.ASK_MODEL ?? "@cf/meta/llama-3.3-70b-instruct-fp8-fast", out);
     const text = extractModelText(out);
     if (!text) return fallback;
     const parsed = JSON.parse(stripFence(text)) as Partial<SynthesisResult> & {
