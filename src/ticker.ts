@@ -13,6 +13,9 @@ export interface TickerEvent {
   kind: string;
   text: string;
   ts: string;
+  // W4 drill-through: the archive row id. LAN events get it once the
+  // Vector relay projects event_id; Bluesky rows always have one.
+  event_id?: string;
 }
 
 const RING_MAX = 100;
@@ -75,11 +78,14 @@ export class TickerHub extends DurableObject {
     const clean: TickerEvent[] = [];
     for (const e of Array.isArray(events) ? events.slice(0, 30) : []) {
       if (!e || typeof e !== "object") continue;
+      const id =
+        typeof e.event_id === "string" && e.event_id ? e.event_id.slice(0, 240) : "";
       clean.push({
         source: String(e.source ?? source).slice(0, 10),
         kind: String(e.kind ?? "event").slice(0, 40),
         text: String(e.text ?? "").slice(0, 120),
         ts: String(e.ts ?? new Date().toISOString()).slice(0, 40),
+        ...(id ? { event_id: id } : {}),
       });
     }
     if (clean.length) {

@@ -18,7 +18,7 @@
     <div class="stat"><span class="stat-value" id="stat-rows">&ndash;</span><span class="stat-label">rows (24h)</span></div>
     <div class="stat" id="stat-fresh-box" title="age of the newest row in the core tables"><span class="stat-value" id="stat-fresh">&ndash;</span><span class="stat-label">ingest freshness</span></div>
     <div class="stat" id="stat-cost-box" title="estimated daily cost"><span class="stat-value" id="stat-cost">&ndash;</span><span class="stat-label">cost/day (est)</span></div>
-    <div class="stat" id="stat-byterow-box" title="compressed bytes per row, from Iceberg snapshot metadata (no scans)"><span class="stat-value" id="stat-byterow">&ndash;</span><span class="stat-label">compressed B/row</span></div>
+    <div class="stat" id="stat-byterow-box" title="stored bytes vs the same rows serialized as JSON (estimated)"><span class="stat-value" id="stat-byterow">&ndash;</span><span class="stat-label">stored vs raw</span></div>
   </div>
   <div class="header-right">
     <div class="bsky-toggle">
@@ -84,6 +84,16 @@
   </div>
   <div id="inbox-list"></div>
   <div id="inbox-report" class="hidden"></div>
+</div>
+
+<div id="event-modal" class="hidden">
+  <div class="event-modal-box">
+    <div class="console-head">
+      <span class="console-title" id="event-modal-title">event detail</span>
+      <button id="event-modal-close" class="btn small" type="button">close</button>
+    </div>
+    <div id="event-modal-body" class="event-modal-body"></div>
+  </div>
 </div>
 
 <script src="/app.js"></script>

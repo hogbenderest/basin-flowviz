@@ -300,6 +300,9 @@ export class JetstreamConsumer extends DurableObject {
       kind: String(r.event_type ?? "event"),
       text: tickerText(r),
       ts: typeof r.event_time === "string" ? r.event_time : new Date().toISOString(),
+      ...(typeof r.event_id === "string" && r.event_id
+        ? { event_id: r.event_id.slice(0, 240) }
+        : {}),
     }));
     if (!sample.length) return;
     try {

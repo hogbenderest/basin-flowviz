@@ -30,12 +30,13 @@ import {
   sanitizeSql,
   runSql,
   runSqlJson,
+  sqlLit,
   MAX_QUERY_CHARS,
 } from "./sql";
 import type { SqlEnv } from "./sql";
 import { handleAsk, handleCatalog, handleEvidenceRows, userOf } from "./ask/handlers";
 import { runDetectors, runDriftCheck, type SchedulerEnv } from "./investigate/detectors";
-import { checkBudget, recordScan } from "./query/service";
+import { checkBudget, recordScan, executeGoverned } from "./query/service";
 import { getHeaderStats, runHeaderCollectors } from "./stats/collectors";
 import type { ServiceEnv } from "./bindings";
 
@@ -212,6 +213,9 @@ function toTickerEvent(e: any): TickerEvent {
     kind: kind.slice(0, 40),
     text,
     ts: new Date(t).toISOString(),
+    ...(typeof e?.event_id === "string" && e.event_id
+      ? { event_id: e.event_id.slice(0, 240) }
+      : {}),
   };
 }
 
@@ -416,6 +420,84 @@ async function handleScenario(env: Env, req: Request): Promise<Response> {
     tables,
   );
   return Response.json(scenario, { headers: { "Cache-Control": "no-store" } });
+}
+
+// ---------------------------------------------------------------------------
+// W4 event lookup: a ticker event id -> its full archive row. The kind map
+// is exact (verified against sql/*.sql and vector-central.toml); HA domains
+// are open-ended because the ha_state_changes pipeline has NO event_type
+// filter, so unmatched kinds get one honest try there - a row resolves only
+// when that exact event_id lives in it. Unknown ids and aged-out rows get
+// an honest found:false, never a guess.
+// ---------------------------------------------------------------------------
+
+const EVENT_KIND_TABLE: Record<string, string> = {
+  sensor: "ha.ha_sensor_readings",
+  syslog: "homelab.syslog",
+  openwrt_log: "homelab.syslog",
+  docker_log: "homelab.syslog",
+  host_metrics: "homelab.host_metrics",
+  unifi_devices: "homelab.unifi_devices",
+  unifi_clients: "homelab.unifi_clients",
+  dns_queries: "homelab.dns_queries",
+  post: "bsky.bsky_post",
+  like: "bsky.bsky_like",
+  repost: "bsky.bsky_repost",
+  follow: "bsky.bsky_follow",
+  block: "bsky.bsky_block",
+};
+// Matches LAN uuid_v4 ids and Bluesky composite at://-style ids
+// (run-3 review amendment 1: NOT uuid-only).
+const EVENT_ID_RE = /^[A-Za-z0-9_.:/-]{12,240}$/;
+
+async function handleEventLookup(
+  env: Env,
+  rawId: string,
+  url: URL,
+  req: Request,
+): Promise<Response> {
+  const headers = {
+    "Cache-Control": "no-store",
+    "Cross-Origin-Resource-Policy": "same-site",
+  };
+  let id = "";
+  try {
+    id = decodeURIComponent(rawId);
+  } catch {
+    return Response.json({ error: "invalid id" }, { status: 400, headers });
+  }
+  if (!EVENT_ID_RE.test(id))
+    return Response.json({ error: "invalid id" }, { status: 400, headers });
+  const kind = (url.searchParams.get("kind") || "").toLowerCase();
+  if (!/^[a-z0-9_]{1,40}$/.test(kind))
+    return Response.json({ error: "invalid kind" }, { status: 400, headers });
+  const table = EVENT_KIND_TABLE[kind] ?? "ha.ha_state_changes";
+  try {
+    const out = await executeGoverned(
+      env as unknown as ServiceEnv,
+      userOf(req),
+      `SELECT * FROM ${table} WHERE event_id = ${sqlLit(id)} ` +
+        `AND __ingest_ts >= now() - INTERVAL '2 hour' LIMIT 1`,
+      { primaryTable: table, skipExplain: true },
+    );
+    if (!out.ok)
+      return Response.json({ found: false, note: out.error }, { status: 200, headers });
+    const row = out.result.rows[0];
+    if (!row)
+      return Response.json(
+        {
+          found: false,
+          note: "no archive row: the event predates the drill-through plumbing, the kind maps elsewhere, or the row aged out of the 2 hour lookup window",
+        },
+        { status: 200, headers },
+      );
+    return Response.json({ found: true, table, row }, { status: 200, headers });
+  } catch {
+    return Response.json(
+      { found: false, note: "lookup failed; try again" },
+      { status: 200, headers },
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -661,6 +743,13 @@ export default {
           { status: 500, headers: { "Cache-Control": "no-store" } },
         );
       }
+    }
+
+    // ---- W4 drill-through: ticker line -> archive row (plan section 1) ----
+
+    const eventMatch = path.match(/^\/api\/event\/([^/?]{1,600})$/);
+    if (eventMatch && req.method === "GET") {
+      return handleEventLookup(env, eventMatch[1], url, req);
     }
 
     // ---- Investigation inbox (plan section 7) ----

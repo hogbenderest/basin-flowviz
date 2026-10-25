@@ -101,6 +101,37 @@ def main() -> int:
             failed += 1
             print(f"FAIL want 200/success:true, got {status}: {desc}")
             print(f"     body: {json.dumps(body)[:200]}")
+
+    # W4 drill-through route (run-3 amendment 6): malformed ids rejected,
+    # well-formed unknown ids honestly found:false, unknown kind rejected.
+    def get_event(path):
+        req = urllib.request.Request(f"{BASE}{path}")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.status, json.load(r)
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.load(e)
+            except Exception:
+                return e.code, {}
+
+    event_cases = [
+        ("event route: too-short id -> 400", "/api/event/" + "x" * 11, 400, None),
+        ("event route: invalid characters -> 400", "/api/event/" + "bad%20id%20here!", 400, None),
+        ("event route: unknown kind -> 400",
+         "/api/event/0123456789ab-cdef-0123?kind=weird%20kind", 400, None),
+        ("event route: valid-shape unknown id -> 200 found:false",
+         "/api/event/0123456789ab-cdef-unknown?kind=syslog", 200, False),
+    ]
+    for desc, path, want, found in event_cases:
+        status, body = get_event(path)
+        ok = status == want and (found is None or body.get("found") is found)
+        if ok:
+            passed += 1
+            print(f"PASS [{want}] {desc}")
+        else:
+            failed += 1
+            print(f"FAIL want {want}, got {status} {json.dumps(body)[:120]}: {desc}")
     print(f"\nlimit battery: {passed} passed, {failed} failed")
     return 1 if failed else 0
 

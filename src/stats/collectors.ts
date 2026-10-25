@@ -12,6 +12,7 @@
 // and the UI labels it as such.
 
 import { runSqlJson } from "../sql";
+import { recordScan } from "../query/service";
 import type { ServiceEnv } from "../bindings";
 import { catalog } from "../catalog/render";
 
@@ -125,6 +126,9 @@ export interface FreshnessSnapshot {
   perTable: Record<string, number | null>;
   worstAgeSec: number | null;
   worstTable: string | null;
+  // Tables whose probe batch failed this pass (they keep their previous
+  // ages; the tooltip discloses them).
+  failures?: string[];
 }
 
 function toMs(m: unknown): number | null {
@@ -136,24 +140,63 @@ function toMs(m: unknown): number | null {
   return null;
 }
 
-export async function probeIngestFreshness(env: ServiceEnv): Promise<FreshnessSnapshot> {
+// Batching (run-3 live finding): Basin caps ONE query at 5000 Iceberg
+// manifests; a 16-table UNION referenced 9582 and failed with code 40020.
+// Batches of 4 stay under the cap. A failed batch keeps its tables'
+// previous ages and is listed in the snapshot's failures array; if every
+// batch fails nothing is written and the next cron tick retries. The
+// 15-minute gate advances only after a snapshot was written (the old
+// withGate wrote it first, which suppressed retries after a failure).
+export async function probeIngestFreshness(env: ServiceEnv): Promise<void> {
+  if (!env.BASIN_SQL_TOKEN) return;
+  const last = (await getMeta(env, "gate_freshness")) as { at?: number } | null;
+  if (Date.now() - Number(last?.at ?? 0) < 15 * 60_000) return;
+  const prev = (await getMeta(env, "freshness")) as FreshnessSnapshot | null;
+  const perTable: Record<string, number | null> = { ...(prev?.perTable ?? {}) };
+  const failures: string[] = [];
+  let anyOk = false;
   const now = Date.now();
-  const checkedAt = new Date(now).toISOString();
-  const perTable: Record<string, number | null> = {};
-  const arms = catalog.tables.map(
-    (t) =>
-      `SELECT '${t.id}' AS t, MAX(__ingest_ts) AS m FROM ${t.id} ` +
-      `WHERE __ingest_ts >= now() - INTERVAL '1 hour'`,
-  );
-  // A single statement: one 10 MB minimum billing per probe, not per table.
-  const d = await runSqlJson(env, `${arms.join(" UNION ALL ")} LIMIT 100`);
-  const rows = (d?.result?.rows ?? []) as { t?: unknown; m?: unknown }[];
-  for (const r of rows) {
-    const id = String(r?.t ?? "");
-    if (!id) continue;
-    const ts = toMs(r?.m);
-    perTable[id] = ts === null ? null : Math.max(0, Math.round((now - ts) / 1000));
+  const tables = catalog.tables;
+  for (let i = 0; i < tables.length; i += 4) {
+    const batch = tables.slice(i, i + 4);
+    const arms = batch.map(
+      (t) =>
+        `SELECT '${t.id}' AS t, MAX(__ingest_ts) AS m FROM ${t.id} ` +
+        `WHERE __ingest_ts >= now() - INTERVAL '1 hour'`,
+    );
+    let learned = false;
+    try {
+      const d = await runSqlJson(env, arms.join(" UNION ALL ") + " LIMIT 20", 45_000);
+      if (!d || d.success === false || !d.result) {
+        // The 40020 message contains the referenced manifest count; log it.
+        const msg = String(d?.errors?.[0]?.message ?? "unknown error");
+        console.error(
+          `freshness batch failed [${batch.map((t) => t.id).join(", ")}]: ${msg.slice(0, 200)}`,
+        );
+        failures.push(...batch.map((t) => t.id));
+        continue;
+      }
+      const seen = new Set<string>();
+      for (const r of (d.result.rows ?? []) as { t?: unknown; m?: unknown }[]) {
+        const id = String(r?.t ?? "");
+        if (!id) continue;
+        const ts = toMs(r?.m);
+        perTable[id] = ts === null ? null : Math.max(0, Math.round((now - ts) / 1000));
+        seen.add(id);
+        learned = true;
+      }
+      // Idle tables: no rows in the last hour is itself information.
+      for (const t of batch) if (!seen.has(t.id)) perTable[t.id] = null;
+      if (learned) anyOk = true;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(
+        `freshness batch threw [${batch.map((t) => t.id).join(", ")}]: ${msg.slice(0, 200)}`,
+      );
+      failures.push(...batch.map((t) => t.id));
+    }
   }
+  if (!anyOk) return; // keep the last-good snapshot; the next tick retries
   let worstAgeSec: number | null = null;
   let worstTable: string | null = null;
   for (const [id, age] of Object.entries(perTable)) {
@@ -163,9 +206,15 @@ export async function probeIngestFreshness(env: ServiceEnv): Promise<FreshnessSn
       worstTable = id;
     }
   }
-  const snap: FreshnessSnapshot = { checkedAt, perTable, worstAgeSec, worstTable };
+  const snap: FreshnessSnapshot = {
+    checkedAt: new Date(now).toISOString(),
+    perTable,
+    worstAgeSec,
+    worstTable,
+    failures: failures.length ? failures : undefined,
+  };
   await setMeta(env, "freshness", snap);
-  return snap;
+  await setMeta(env, "gate_freshness", { at: Date.now() });
 }
 
 // ---------------------------------------------------------------------------
@@ -182,9 +231,19 @@ export interface CompressionSnapshot {
   updatedAt: string;
   bytesPerRow: number | null;
   bytesPerDay: number | null;
+  // W9 headline: stored bytes vs the same rows serialized as JSON,
+  // weighted by storage growth across tables (percent of raw).
+  warehousePercentRaw?: number | null;
   perTable: Record<
     string,
-    { bytesPerRow: number | null; bytesPerDay: number | null; dataFiles: number; checkedAt: string }
+    {
+      bytesPerRow: number | null;
+      bytesPerDay: number | null;
+      dataFiles: number;
+      checkedAt: string;
+      rawBytesPerRow?: number | null;
+      percentOfRaw?: number | null;
+    }
   >;
 }
 
@@ -192,10 +251,13 @@ export async function collectTableStats(env: ServiceEnv): Promise<CompressionSna
   if (!env.BASIN_SQL_TOKEN || !env.REPORTS_D1) return null;
   const now = Date.now();
   const checkedAt = new Date(now).toISOString();
+  const prevComp = (await getMeta(env, "compression")) as CompressionSnapshot | null;
   const perTable: CompressionSnapshot["perTable"] = {};
   let sumBytes = 0;
   let sumRows = 0;
   let sumPerDay = 0;
+  let sumStoredPerDay = 0;
+  let sumRawPerDay = 0;
 
   for (const t of catalog.tables) {
     const dot = t.id.indexOf(".");
@@ -239,19 +301,56 @@ export async function collectTableStats(env: ServiceEnv): Promise<CompressionSna
         windowMinutes && windowMinutes > 0
           ? windowBytes * (1440 / windowMinutes)
           : null;
+      // W9: raw sample - average serialized-JSON bytes of recent rows,
+      // windowed on the table's own time column (event-time tables are
+      // not sampled on __ingest_ts). A missed sample keeps the last
+      // known value; every sample records its scan bytes so the
+      // cost/day figure stays truthful.
+      let rawBpr: number | null = prevComp?.perTable?.[t.id]?.rawBytesPerRow ?? null;
+      try {
+        const tcol = t.queryTimeColumn || "__ingest_ts";
+        const d = await runSqlJson(
+          env,
+          `SELECT * FROM ${t.id} WHERE ${tcol} >= now() - INTERVAL '1 hour' LIMIT 30`,
+          45_000,
+        );
+        if (d && d.success !== false && d.result && Array.isArray(d.result.rows) && d.result.rows.length) {
+          const sample = d.result.rows as Record<string, unknown>[];
+          rawBpr = sample.reduce((a, r) => a + JSON.stringify(r).length, 0) / sample.length;
+          const sbytes = Number(
+            (d.result.metrics as { bytes_scanned?: number } | undefined)?.bytes_scanned ?? 0,
+          );
+          if (sbytes > 0) {
+            await recordScan(
+              env,
+              "system",
+              new Date().toISOString().slice(0, 10),
+              sbytes,
+            ).catch(() => {});
+          }
+        }
+      } catch {
+        /* keep the last known raw value */
+      }
       perTable[t.id] = {
         bytesPerRow: bpr,
         bytesPerDay: bpd,
         dataFiles: Number(newest.summary?.["total-data-files"] ?? 0),
         checkedAt,
+        rawBytesPerRow: rawBpr,
+        percentOfRaw: rawBpr !== null && bpr !== null ? (bpr / rawBpr) * 100 : null,
       };
       sumBytes += windowBytes;
       sumRows += windowRows;
       if (bpd !== null) sumPerDay += bpd;
+      if (bpd !== null && bpr !== null && rawBpr !== null && bpr > 0) {
+        sumStoredPerDay += bpd;
+        sumRawPerDay += rawBpr * (bpd / bpr);
+      }
       await env.REPORTS_D1.prepare(
         "INSERT OR REPLACE INTO table_stats " +
-          "(table_id, checked_at, bytes_per_row, window_bytes, window_rows, window_minutes, data_files, snapshot_id) " +
-          "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+          "(table_id, checked_at, bytes_per_row, window_bytes, window_rows, window_minutes, data_files, snapshot_id, raw_bytes_per_row) " +
+          "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
       )
         .bind(
           t.id,
@@ -262,6 +361,7 @@ export async function collectTableStats(env: ServiceEnv): Promise<CompressionSna
           windowMinutes,
           perTable[t.id].dataFiles,
           String(newest["snapshot-id"] ?? ""),
+          rawBpr,
         )
         .run()
         .catch(() => {});
@@ -271,10 +371,13 @@ export async function collectTableStats(env: ServiceEnv): Promise<CompressionSna
   }
 
   if (!Object.keys(perTable).length) return null;
+  const warehousePercentRaw =
+    sumRawPerDay > 0 ? (sumStoredPerDay / sumRawPerDay) * 100 : null;
   const snap: CompressionSnapshot = {
     updatedAt: checkedAt,
     bytesPerRow: sumRows > 0 ? sumBytes / sumRows : null,
     bytesPerDay: sumPerDay > 0 ? sumPerDay : null,
+    warehousePercentRaw,
     perTable,
   };
   await setMeta(env, "compression", snap);
@@ -385,7 +488,11 @@ export async function computeCostDay(env: ServiceEnv): Promise<CostSnapshot> {
 // ---------------------------------------------------------------------------
 
 export async function runHeaderCollectors(env: ServiceEnv): Promise<void> {
-  await withGate(env, "gate_freshness", 15 * 60_000, () => probeIngestFreshness(env));
+  // Freshness owns its gate manually (the gate advances only after a
+  // snapshot was written, so failures retry on the next cron tick).
+  await probeIngestFreshness(env).catch((e) => {
+    console.error("freshness probe failed", e instanceof Error ? e.message : String(e));
+  });
   await withGate(env, "gate_compression", 60 * 60_000, async () => {
     await collectTableStats(env);
     await computeCostDay(env);

@@ -444,3 +444,39 @@ body.scoped #edges path.edge-hover { opacity: 1; stroke: var(--orange-dim); }
 .report-conf { color: var(--muted); font-size: 11px; }
 .finding { display: flex; align-items: baseline; gap: 8px; padding: 2px 0; font-size: 12.5px; }
 
+
+
+/* ---------- W4 event popup (drill-through modal) ---------- */
+
+#event-modal {
+  position: fixed; inset: 0; z-index: 50;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(5, 7, 10, 0.72);
+}
+#event-modal.hidden { display: none; }
+.event-modal-box {
+  width: min(760px, 92vw); max-height: 82vh;
+  background: var(--panel); border: 1px solid var(--card-border); border-radius: 12px;
+  padding: 14px 16px; display: flex; flex-direction: column; gap: 10px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6);
+}
+.event-modal-body { overflow-y: auto; font-size: 12px; }
+.event-modal-body table { width: 100%; border-collapse: collapse; font-family: ui-monospace, Menlo, monospace; }
+.event-modal-body td, .event-modal-body th {
+  border: 1px solid var(--card-border); padding: 4px 8px;
+  text-align: left; vertical-align: top; word-break: break-all;
+}
+.event-modal-body th { color: var(--muted); background: var(--group); width: 26%; white-space: nowrap; }
+.event-raw {
+  margin-top: 8px; padding: 8px 10px; background: #0d1017; border-radius: 8px;
+  font-family: ui-monospace, Menlo, monospace; font-size: 10.5px;
+  white-space: pre-wrap; word-break: break-all;
+  max-height: 240px; overflow-y: auto; color: var(--muted);
+}
+.event-note { color: var(--muted); padding: 4px 0; }
+.event-note b { color: var(--text); }
+
+/* W10: aggregate count on collapsed ticker lines */
+.ticker-count { color: var(--orange); font-size: 10px; font-weight: 700; flex-shrink: 0; }
+#ticker-list li { cursor: pointer; }
+#ticker-list li:hover .ticker-text { color: var(--text); }

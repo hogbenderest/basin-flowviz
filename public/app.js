@@ -457,14 +457,22 @@
       if (h.compression) {
         const el = $("stat-byterow");
         if (el) {
-          el.textContent =
-            h.compression.bytesPerRow == null
-              ? "--"
-              : Math.round(h.compression.bytesPerRow) + " B";
+          const pct = h.compression.warehousePercentRaw;
+          el.textContent = pct == null ? "--" : (pct < 10 ? pct.toFixed(1) : Math.round(pct)) + "%";
           const pt = Object.entries(h.compression.perTable || {})
-            .map(([id, s]) => `${id}: ${s.bytesPerRow == null ? "n/a" : Math.round(s.bytesPerRow) + " B/row"}`)
+            .map(([id, s]) => {
+              const raw = s.rawBytesPerRow;
+              const sto = s.bytesPerRow;
+              const p = raw && sto != null ? (sto / raw) * 100 : null;
+              const note =
+                p != null && p > 100 ? " (small-file footer tax until compaction merges commits)" : "";
+              return `${id}: ${raw ? Math.round(raw) + " B raw" : "raw n/a"} -> ${sto == null ? "n/a" : Math.round(sto) + " B stored"}${p != null ? ` (${Math.round(p)}%${note})` : ""}`;
+            })
             .join("\n");
-          $("stat-byterow-box").title = pt + "\n(Iceberg snapshot metadata; zero scanned bytes)";
+          $("stat-byterow-box").title =
+            "warehouse: stored bytes vs the same rows serialized as JSON\n" +
+            pt +
+            "\nmethod: 30-row JSON sample vs Iceberg snapshot bytes, hourly, weighted by storage growth; est";
         }
       }
       if (h.unread != null) {
@@ -509,9 +517,95 @@
 
   const tickerList = $("ticker-list");
 
+  const escapeHtml = (s) =>
+    String(s).replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    }[c]));
+
+  // W4 popup: click a ticker line to see the full archive row (human
+  // fields plus raw JSON), or the honest fallback when there is no id
+  // yet or the row has aged out.
+  function openEventPopup(evInfo) {
+    const modal = $("event-modal");
+    const body = $("event-modal-body");
+    if (!modal || !body) return;
+    $("event-modal-title").textContent = `event detail: ${String(evInfo.kind || "event")}`;
+    if (!evInfo.id) {
+      body.innerHTML =
+        `<div class="event-note">This ticker line has no event id yet: LAN events gain click-through once the Vector relay update ships. ` +
+        `What the ticker holds: <b>${escapeHtml(evInfo.text || "")}</b></div>`;
+      modal.classList.remove("hidden");
+      return;
+    }
+    body.innerHTML = `<div class="event-note">looking up the archive row...</div>`;
+    modal.classList.remove("hidden");
+    fetch(
+      `/api/event/${encodeURIComponent(evInfo.id)}?kind=${encodeURIComponent(String(evInfo.kind || ""))}`,
+      { cache: "no-store" },
+    )
+      .then((r) => r.json())
+      .then((d) => {
+        if (d && d.found && d.row) {
+          body.innerHTML = "";
+          const tbl = document.createElement("table");
+          for (const [k, v] of Object.entries(d.row)) {
+            const tr = document.createElement("tr");
+            const th = document.createElement("th");
+            th.textContent = k;
+            const td = document.createElement("td");
+            td.textContent = v == null ? "NULL" : typeof v === "object" ? JSON.stringify(v) : String(v);
+            tr.append(th, td);
+            tbl.appendChild(tr);
+          }
+          const note = document.createElement("div");
+          note.className = "event-note";
+          note.textContent = `from ${d.table}; full row as stored (behind Access, same stance as evidence)`;
+          const raw = document.createElement("div");
+          raw.className = "event-raw";
+          raw.textContent = JSON.stringify(d.row, null, 2);
+          body.append(tbl, note, raw);
+        } else {
+          body.innerHTML =
+            `<div class="event-note">${escapeHtml((d && d.note) || "archive row not found")}. ` +
+            `What the ticker holds: <b>${escapeHtml(evInfo.text || "")}</b></div>`;
+        }
+      })
+      .catch(() => {
+        body.innerHTML = `<div class="event-note">lookup failed; try again.</div>`;
+      });
+  }
+
   function addTicker(ev) {
-    const li = document.createElement("li");
     const kind = String(ev.kind || "event");
+    const evTsMs = Date.parse(ev.ts || "") || Date.now();
+    // W10: batch ingest prints identical lines (dozens of same-kind rows
+    // in one second) and the feed looks frozen. Collapse consecutive
+    // same-kind events within a 60 s window into one line with a count;
+    // the line keeps the newest timestamp and the LATEST event_id, which
+    // the W4 popup drills through.
+    const first = tickerList.firstElementChild;
+    if (
+      first &&
+      first.dataset.kind === kind &&
+      evTsMs - Number(first.dataset.tsMs || 0) <= 60_000
+    ) {
+      const n = (Number(first.dataset.count || 1) || 1) + 1;
+      first.dataset.count = String(n);
+      first.dataset.tsMs = String(evTsMs);
+      first.dataset.text = String(ev.text || first.dataset.text || "");
+      if (ev.event_id) first.dataset.eventId = String(ev.event_id);
+      const countEl = first.querySelector(".ticker-count");
+      if (countEl) countEl.textContent = "x" + n;
+      const tsEl = first.querySelector(".ticker-ts");
+      if (tsEl) tsEl.textContent = (ev.ts || "").slice(11, 19);
+      return;
+    }
+    const li = document.createElement("li");
+    li.dataset.kind = kind;
+    li.dataset.tsMs = String(evTsMs);
+    li.dataset.text = String(ev.text || "");
+    if (ev.event_id) li.dataset.eventId = String(ev.event_id);
+    li.title = "click for the full archive row";
     const badge = document.createElement("span");
     badge.className = "badge " + (ev.source === "bluesky" ? "bluesky" : "lan");
     badge.textContent = kind.slice(0, 18);
@@ -519,10 +613,19 @@
     txt.className = "ticker-text";
     txt.textContent = String(ev.text || "");
     txt.title = String(ev.text || "");
+    const count = document.createElement("span");
+    count.className = "ticker-count";
     const ts = document.createElement("span");
     ts.className = "ticker-ts";
     ts.textContent = (ev.ts || "").slice(11, 19);
-    li.append(badge, txt, ts);
+    li.append(badge, txt, count, ts);
+    li.addEventListener("click", () => {
+      openEventPopup({
+        id: li.dataset.eventId || "",
+        kind,
+        text: li.dataset.text || "",
+      });
+    });
     tickerList.prepend(li);
     while (tickerList.children.length > 40) tickerList.removeChild(tickerList.lastChild);
   }
@@ -778,7 +881,19 @@
 
   // ---- keyboard shortcuts ----
 
+  const eventModal = $("event-modal");
+  if (eventModal) {
+    $("event-modal-close").addEventListener("click", () => eventModal.classList.add("hidden"));
+    eventModal.addEventListener("click", (e) => {
+      if (e.target === eventModal) eventModal.classList.add("hidden");
+    });
+  }
+
   document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      const m = $("event-modal");
+      if (m) m.classList.add("hidden");
+    }
     const tag = (e.target && e.target.tagName || "").toLowerCase();
     if (tag === "textarea" || tag === "input") return;
     if (e.key === "p") document.body.classList.toggle("presentation");
