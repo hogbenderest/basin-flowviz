@@ -6,8 +6,6 @@ window.FlowvizAsk = (() => {
   "use strict";
 
   const $ = (id) => document.getElementById(id);
-  const panel = () => $("ask-panel");
-  const bar = () => $("askbar");
 
   // Map the flow map's card ids to catalogue table ids (public/app.js COLUMNS).
   const CARD_TO_TABLE = {
@@ -165,7 +163,9 @@ window.FlowvizAsk = (() => {
   }
 
   function openPanel() {
-    panel().classList.remove("hidden");
+    // W8: the Ask workspace is always mounted; make sure it is the
+    // active view and that charts resize into the wider workspace.
+    if (window.__flowvizSwitchTab) window.__flowvizSwitchTab("ask");
     setTimeout(() => window.FlowvizCharts && FlowvizCharts.resizeAll(), 30);
   }
 
@@ -475,14 +475,6 @@ window.FlowvizAsk = (() => {
   // investigation inbox
   // ------------------------------------------------------------------
 
-  const inbox = () => $("inbox");
-
-  async function toggleInbox() {
-    const el = inbox();
-    el.classList.toggle("hidden");
-    if (!el.classList.contains("hidden")) await refreshInbox();
-  }
-
   async function refreshInbox() {
     const list = $("inbox-list");
     list.innerHTML = "";
@@ -631,7 +623,6 @@ window.FlowvizAsk = (() => {
     $("ask-input").addEventListener("keydown", (e) => {
       if (e.key === "Enter") ask($("ask-input").value.trim());
     });
-    $("ask-close").addEventListener("click", () => panel().classList.add("hidden"));
     $("ask-clear-scope")?.addEventListener("click", () => {
       session.tableScope = null;
       session.fromUTC = null;
@@ -639,9 +630,11 @@ window.FlowvizAsk = (() => {
       if (window.__flowvizHighlight) window.__flowvizHighlight(null);
       renderSession();
     });
-    $("inbox-btn").addEventListener("click", toggleInbox);
-    $("inbox-close").addEventListener("click", () => inbox().classList.add("hidden"));
-    $("askbar-toggle").addEventListener("click", () => panel().classList.toggle("hidden"));
+    // W8: the Investigations tab loads its inbox on activation.
+    document.addEventListener("flowviz:tab", (ev) => {
+      if (ev.detail && ev.detail.name === "investigations") refreshInbox();
+    });
+    if (document.body.dataset.tab === "investigations") refreshInbox();
     loadCatalog();
     renderSession();
   }

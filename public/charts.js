@@ -83,7 +83,8 @@ window.FlowvizCharts = (() => {
       xAxis: { type: "time", ...baseAxis },
       yAxis: { type: "value", ...baseAxis },
       dataZoom: [
-        { type: "inside" },
+        // W8: plain wheel scrolls the workspace; shift+wheel zooms.
+        { type: "inside", zoomOnMouseWheel: "shift" },
         { type: "slider", height: 16, bottom: 8, borderColor: C.grid, textStyle: { color: C.text } },
       ],
       series: [...series.entries()].map(([k, pts], i) => ({

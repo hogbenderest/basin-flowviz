@@ -171,6 +171,11 @@
           document.dispatchEvent(
             new CustomEvent("flowviz:card", { detail: { id: c.id, label: c.label } }),
           );
+          // W8: table cards jump to the Ask tab with the scope set.
+          if (ALL_TABLES.includes(c.id)) {
+            setAskMode("ai");
+            switchTab("ask");
+          }
         });
         // W6: hovering a card brightens its edges; static interop edges
         // become visible invitations instead of fake ambient flow.
@@ -305,6 +310,11 @@
   function frame(now) {
     const dt = Math.min((now - lastFrame) / 1000, 0.1);
     lastFrame = now;
+    // W8: the map only animates while its tab is active.
+    if (document.body.dataset.tab !== "flow") {
+      requestAnimationFrame(frame);
+      return;
+    }
 
     for (const color of Object.keys(rates)) {
       const target = Math.min(rates[color], TARGET_CAP[color]);
@@ -732,11 +742,48 @@
     }
   }
 
-  // ---- console ----
+  // ---- tabs (W8): FlowViz | Investigations | Ask ----
 
-  const consoleEl = $("console");
-  $("console-btn").addEventListener("click", () => consoleEl.classList.toggle("hidden"));
-  $("console-close").addEventListener("click", () => consoleEl.classList.add("hidden"));
+  const TABS = ["flow", "investigations", "ask"];
+  const tabBtns = Array.from(document.querySelectorAll("#tabs .tab"));
+
+  function switchTab(name) {
+    if (!TABS.includes(name)) return;
+    document.body.dataset.tab = name;
+    for (const btn of tabBtns) btn.classList.toggle("active", btn.dataset.tab === name);
+    for (const view of document.querySelectorAll(".tab-view"))
+      view.classList.toggle("active", view.id === `tab-${name}`);
+    try {
+      localStorage.setItem("flowviz-tab", name);
+    } catch {}
+    document.dispatchEvent(new CustomEvent("flowviz:tab", { detail: { name } }));
+    if (name === "flow") scheduleLayout();
+  }
+  window.__flowvizSwitchTab = switchTab;
+
+  // ---- Ask tab input mode (AI | SQL) ----
+
+  function setAskMode(mode) {
+    const ai = mode === "ai";
+    $("mode-ai").classList.toggle("active", ai);
+    $("mode-sql").classList.toggle("active", !ai);
+    $("ask-input").classList.toggle("hidden", !ai);
+    $("ask-submit").classList.toggle("hidden", !ai);
+    $("sql-input").classList.toggle("hidden", ai);
+    $("sql-run").classList.toggle("hidden", ai);
+    $("ask-chips").classList.toggle("hidden", !ai);
+    $("sql-chips").classList.toggle("hidden", ai);
+    $("ask-body").classList.toggle("hidden", !ai);
+    $("sql-result").classList.toggle("hidden", ai);
+    try {
+      localStorage.setItem("flowviz-ask-mode", mode);
+    } catch {}
+  }
+  window.__flowvizAskMode = setAskMode;
+  $("mode-ai").addEventListener("click", () => setAskMode("ai"));
+  $("mode-sql").addEventListener("click", () => setAskMode("sql"));
+
+  // ---- SQL console (the Ask tab's SQL mode) ----
 
   const CHIPS = [
     { label: "Likes so far (24h)",
@@ -763,7 +810,7 @@
       sql: "SHOW TABLES IN bsky" },
   ];
 
-  const chipsEl = $("chips");
+  const chipsEl = $("sql-chips");
   for (const chip of CHIPS) {
     const b = document.createElement("button");
     b.className = "chip";
@@ -896,6 +943,7 @@
     }
     const tag = (e.target && e.target.tagName || "").toLowerCase();
     if (tag === "textarea" || tag === "input") return;
+    if (["1", "2", "3"].includes(e.key)) switchTab(TABS[Number(e.key) - 1]);
     if (e.key === "p") document.body.classList.toggle("presentation");
     if (e.key === "f") {
       if (document.fullscreenElement) document.exitFullscreen();
@@ -922,4 +970,15 @@
   pollStats();
   setInterval(pollStats, 3000);
   pollRows();
+  // W8 boot: restore the last input mode and tab.
+  try {
+    setAskMode(localStorage.getItem("flowviz-ask-mode") === "sql" ? "sql" : "ai");
+  } catch {
+    setAskMode("ai");
+  }
+  let savedTab = null;
+  try {
+    savedTab = localStorage.getItem("flowviz-tab");
+  } catch {}
+  switchTab(TABS.includes(savedTab) ? savedTab : "flow");
 })();
