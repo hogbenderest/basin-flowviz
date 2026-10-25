@@ -157,8 +157,8 @@ export async function probeIngestFreshness(env: ServiceEnv): Promise<void> {
   let anyOk = false;
   const now = Date.now();
   const tables = catalog.tables;
-  for (let i = 0; i < tables.length; i += 4) {
-    const batch = tables.slice(i, i + 4);
+  const probeBatch = async (batch: typeof tables): Promise<void> => {
+    if (!batch.length) return;
     const arms = batch.map(
       (t) =>
         `SELECT '${t.id}' AS t, MAX(__ingest_ts) AS m FROM ${t.id} ` +
@@ -169,12 +169,21 @@ export async function probeIngestFreshness(env: ServiceEnv): Promise<void> {
       const d = await runSqlJson(env, arms.join(" UNION ALL ") + " LIMIT 20", 45_000);
       if (!d || d.success === false || !d.result) {
         // The 40020 message contains the referenced manifest count; log it.
-        const msg = String(d?.errors?.[0]?.message ?? "unknown error");
+        const err = d?.errors?.[0];
+        const msg = String(err?.message ?? "unknown error");
         console.error(
           `freshness batch failed [${batch.map((t) => t.id).join(", ")}]: ${msg.slice(0, 200)}`,
         );
-        failures.push(...batch.map((t) => t.id));
-        continue;
+        if (err?.code === 40020 && batch.length > 1) {
+          // Manifest cap: halve and retry - single-table probes are
+          // proven safe in production (the per-answer freshness path).
+          const mid = Math.ceil(batch.length / 2);
+          await probeBatch(batch.slice(0, mid));
+          await probeBatch(batch.slice(mid));
+        } else {
+          failures.push(...batch.map((t) => t.id));
+        }
+        return;
       }
       const seen = new Set<string>();
       for (const r of (d.result.rows ?? []) as { t?: unknown; m?: unknown }[]) {
@@ -195,6 +204,14 @@ export async function probeIngestFreshness(env: ServiceEnv): Promise<void> {
       );
       failures.push(...batch.map((t) => t.id));
     }
+  };
+  // Stride-4 interleave: the small-commit homelab tables are heavy on
+  // manifests (live-probed: the four of them in one batch referenced
+  // 5546 manifests and hit the 5000 cap), so each batch takes at most
+  // one of them. Halving handles any future drift.
+  for (let k = 0; k < 4; k++) {
+    const batch = tables.filter((_, j) => j % 4 === k);
+    await probeBatch(batch);
   }
   if (!anyOk) return; // keep the last-good snapshot; the next tick retries
   let worstAgeSec: number | null = null;
