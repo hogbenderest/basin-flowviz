@@ -129,6 +129,9 @@ export interface FreshnessSnapshot {
   // Tables whose probe batch failed this pass (they keep their previous
   // ages; the tooltip discloses them).
   failures?: string[];
+  // W1 watchdog: age of the newest wifi_client row; null means the wifi
+  // poller has produced nothing in the probe window (> ~20 min = stale).
+  wifiPollerAgeSec?: number | null;
 }
 
 function toMs(m: unknown): number | null {
@@ -213,6 +216,28 @@ export async function probeIngestFreshness(env: ServiceEnv): Promise<void> {
     const batch = tables.filter((_, j) => j % 4 === k);
     await probeBatch(batch);
   }
+  // W1 watchdog: age of the newest wifi_client row (single filtered
+  // probe, same 10 MB minimum; > 10 minutes = poller stale). Text-match
+  // guard, not a JSON-path filter: json_get_str returns null on the
+  // poller's string-wrapped fields rows, and JSON-path filters throw
+  // the 2000-byte cap error on the oversized legacy server111 rows in
+  // the same window (live-verified 2026-10-25).
+  let wifiPollerAgeSec: number | null = null;
+  try {
+    const d = await runSqlJson(
+      env,
+      `SELECT MAX(__ingest_ts) AS m FROM homelab.host_metrics ` +
+        `WHERE __ingest_ts >= now() - INTERVAL '20 minutes' ` +
+        `AND fields ILIKE '%wifi_client%' LIMIT 1`,
+      45_000,
+    );
+    if (d && d.success !== false && d.result) {
+      const ts = toMs((d.result.rows?.[0] as { m?: unknown } | undefined)?.m);
+      wifiPollerAgeSec = ts === null ? null : Math.max(0, Math.round((now - ts) / 1000));
+    }
+  } catch {
+    /* best-effort watchdog */
+  }
   if (!anyOk) return; // keep the last-good snapshot; the next tick retries
   let worstAgeSec: number | null = null;
   let worstTable: string | null = null;
@@ -229,6 +254,7 @@ export async function probeIngestFreshness(env: ServiceEnv): Promise<void> {
     worstAgeSec,
     worstTable,
     failures: failures.length ? failures : undefined,
+    wifiPollerAgeSec,
   };
   await setMeta(env, "freshness", snap);
   await setMeta(env, "gate_freshness", { at: Date.now() });

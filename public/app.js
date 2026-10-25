@@ -443,7 +443,12 @@
           const per = Object.entries(h.freshness.perTable || {})
             .map(([id, a]) => `${id}: ${a == null ? "no rows in the last hour" : fmtAge(a)}`)
             .join("\n");
-          $("stat-fresh-box").title = per + "\n(newest-row age, probed every 15 min)";
+          const wifi = h.freshness.wifiPollerAgeSec;
+          const wifiLine =
+            wifi === undefined
+              ? ""
+              : `\nwifi poller: newest wifi_client row ${wifi == null ? "not found in the last 20 minutes (stale)" : fmtAge(wifi)} old`;
+          $("stat-fresh-box").title = per + wifiLine + "\n(newest-row age, probed every 15 min)";
         }
       }
       if (h.cost) {

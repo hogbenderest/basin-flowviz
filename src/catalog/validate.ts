@@ -45,8 +45,11 @@ function jsonExpr(tableId: string, path: string): string | null {
   if (!col) return null;
   const direct = `json_get_str(${col.name}, ${sqlLit(path)})`;
   const nested = `json_get_str(json_get_str(${col.name}), ${sqlLit(path)})`;
-  // dns_queries rows exist in both encodings across 2026-10-24: cover both.
-  if (tableId === "homelab.dns_queries") return `COALESCE(${direct}, ${nested})`;
+  // dns_queries and host_metrics both carry mixed encodings (dns across
+  // 2026-10-24; host_metrics gained direct-object wifi radio rows when the
+  // poller landed 2026-10-25T09:18Z). Cover both arms for these tables.
+  if (tableId === "homelab.dns_queries" || tableId === "homelab.host_metrics")
+    return `COALESCE(${direct}, ${nested})`;
   return nested;
 }
 
@@ -66,17 +69,24 @@ function measureExpr(
   if (measure.jsonPath) colExpr = jsonExpr(tableId, measure.jsonPath);
   else if (measure.column) colExpr = columnExpr(tableId, { column: measure.column });
   if (!colExpr) return null;
+  // JSON-path values come back as strings: numeric measures need a cast
+  // (TRY_CAST drops nulls from aggregates). Note: on the string-wrapped
+  // wifi radio rows json_get_str returns null for every path, so numeric
+  // host_metrics values actually need the regexp extraction the verified
+  // wifi questions use (catalogue fact, live-verified 2026-10-25); this
+  // cast only makes json-path measures type-safe where they work at all.
+  const numeric = measure.jsonPath ? `TRY_CAST(${colExpr} AS DOUBLE)` : colExpr;
   switch (measure.expr) {
     case "approx_distinct":
       return `approx_distinct(${colExpr})`;
     case "avg":
-      return `AVG(${colExpr})`;
+      return `AVG(${numeric})`;
     case "max":
-      return `MAX(${colExpr})`;
+      return `MAX(${numeric})`;
     case "min":
-      return `MIN(${colExpr})`;
+      return `MIN(${numeric})`;
     case "sum":
-      return `SUM(${colExpr})`;
+      return `SUM(${numeric})`;
     default:
       return null;
   }
