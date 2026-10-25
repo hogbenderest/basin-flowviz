@@ -4,8 +4,40 @@
 
 import type { Catalogue, CatalogueTable, VerifiedQuery } from "./types";
 import catalogJson from "./catalog.v1.json";
+import localJson from "./catalog.local.json";
 
-export const catalog = catalogJson as unknown as Catalogue;
+// W7 privacy pattern: the committed catalogue carries neutral placeholders
+// for anything that identifies people or real devices; the gitignored
+// catalog.local.json overlay restores real values at build time. Merge
+// rules: entityMaps.<key> and clientHashIdentities are replaced
+// wholesale; questions.<id> overrides apply field by field.
+// scripts/deploy.sh copies the committed example over a missing overlay,
+// so a clean checkout still builds with neutral data.
+type LocalOverlay = {
+  entityMaps?: Catalogue["entityMaps"];
+  clientHashIdentities?: Catalogue["clientHashIdentities"];
+  questions?: Record<string, Partial<VerifiedQuery>>;
+};
+
+function mergeCatalog(base: Catalogue, local: LocalOverlay): Catalogue {
+  const out: Catalogue = { ...base, entityMaps: { ...base.entityMaps } };
+  for (const [key, entries] of Object.entries(local.entityMaps ?? {})) {
+    out.entityMaps[key] = entries;
+  }
+  if (local.clientHashIdentities)
+    out.clientHashIdentities = { ...local.clientHashIdentities };
+  if (local.questions) {
+    out.questions = out.questions.map((q) =>
+      local.questions![q.id] ? { ...q, ...local.questions![q.id] } : q,
+    );
+  }
+  return out;
+}
+
+export const catalog = mergeCatalog(
+  catalogJson as unknown as Catalogue,
+  localJson as LocalOverlay,
+);
 
 export function getTable(id: string): CatalogueTable | undefined {
   return catalog.tables.find((t) => t.id === id);

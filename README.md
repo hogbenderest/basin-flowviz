@@ -170,15 +170,27 @@ the fields API lists gated fields the created streams do not carry.
 
 **7. Catalog.** `src/catalog/catalog.v1.json` is the single source of
 truth for the Ask bar and investigations - tables, columns, caveats and
-verified questions. It ships populated for this deployment's tables:
-edit it for yours, bump `version`, redeploy. `clientHashIdentities`
-ships EMPTY on purpose (it maps client hashes to device names; publishing
-such a map undoes the salted-hash privacy control). To label your own
-known devices, populate it with hashes computed under YOUR
-`CLIENT_SALT` - never publish the populated map. The */5 cron runs a
-once-daily drift check against the warehouse and flags mismatches in the
-UI; ASK_MODEL, SCAN_BUDGET_MB and ASK_PER_MINUTE tune the Ask service
-via `wrangler.jsonc` vars.
+verified questions. It ships with NEUTRAL placeholders for anything that
+identifies people or real devices (room labels, HA entity ids). Your
+private values live in a gitignored local overlay,
+`src/catalog/catalog.local.json`. `scripts/deploy.sh` copies the
+committed `catalog.local.example.json` to that path when it is missing,
+so a clean checkout still builds and deploys with neutral labels.
+Overlay merge rules: `entityMaps.<key>` and `clientHashIdentities` are
+replaced wholesale; `questions.<id>` overrides apply field by field (use
+it to point `q-hottest-rooms` at your real sensor entity ids). Never
+commit the populated overlay, and never publish a populated
+`clientHashIdentities` map (it maps client hashes to device names;
+publishing such a map undoes the salted-hash privacy control). The */5
+cron runs a once-daily drift check against the warehouse and flags
+mismatches in the UI; ASK_MODEL, SCAN_BUDGET_MB and ASK_PER_MINUTE tune
+the Ask service via `wrangler.jsonc` vars.
+
+Device identifiers in the archive: hostname-style fields (UniFi client
+names, syslog hosts, docker container names) are stored as-is in the
+warehouse behind Cloudflare Access. The repo, the ticker and every
+public artifact stay free of household identifiers; if that trade-off
+does not suit you, hash identities before ingest instead.
 
 **8. Verify.** `SELECT COUNT(*)` on each table after the first roll
 (sinks roll every 300 s), flip a light switch and watch

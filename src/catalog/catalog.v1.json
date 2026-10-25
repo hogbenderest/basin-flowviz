@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generatedAt": "2026-10-24T11:35:00Z",
+  "generatedAt": "2026-10-25T00:00:00Z",
   "timezone": "Australia/Perth",
   "facts": [
     "JSON-typed columns store double-encoded JSON: the cell is a JSON string containing the JSON. Unwrap with a single-argument json_get_str(fields), then look up keys with json_get_str(json_get_str(fields), '<key>').",
@@ -21,8 +21,8 @@
   "clientHashIdentities": {},
   "entityMaps": {
     "temperature": [
-      { "entityId": "sensor.temp_helenian", "label": "Helen and Ian bedroom", "room": "bedroom (Helen and Ian)", "unit": "C", "kind": "room-temp" },
-      { "entityId": "sensor.temp_marcus", "label": "Marcus room", "room": "Marcus room", "unit": "C", "kind": "room-temp" },
+      { "entityId": "sensor.temp_main_bedroom", "label": "main bedroom", "room": "main bedroom", "unit": "C", "kind": "room-temp" },
+      { "entityId": "sensor.temp_second_bedroom", "label": "second bedroom", "room": "second bedroom", "unit": "C", "kind": "room-temp" },
       { "entityId": "sensor.back_garden_soil_moisture_temperature", "label": "back garden soil", "room": "outdoor", "unit": "C", "kind": "outdoor" },
       { "entityId": "sensor.balcony_bay_leaf_soil_moisture_temperature", "label": "balcony bay leaf soil", "room": "outdoor", "unit": "C", "kind": "outdoor" },
       { "entityId": "sensor.coolbinia_now_temp_now", "label": "weather station (current)", "room": "outdoor", "unit": "C", "kind": "weather" },
@@ -459,7 +459,7 @@
       "archetype": "rank",
       "table": "ha.ha_sensor_readings",
       "chart": "ranked-bars",
-      "sql": "SELECT entity_id, ROUND(AVG(value), 1) AS avg_c, MAX(value) AS max_c, COUNT(*) AS n FROM ha.ha_sensor_readings WHERE entity_id IN ('sensor.temp_helenian', 'sensor.temp_marcus') AND value IS NOT NULL AND ts >= {FROM} AND ts < {TO} GROUP BY entity_id ORDER BY avg_c DESC LIMIT 15",
+      "sql": "SELECT entity_id, ROUND(AVG(value), 1) AS avg_c, MAX(value) AS max_c, COUNT(*) AS n FROM ha.ha_sensor_readings WHERE entity_id IN ('sensor.temp_main_bedroom', 'sensor.temp_second_bedroom') AND value IS NOT NULL AND ts >= {FROM} AND ts < {TO} GROUP BY entity_id ORDER BY avg_c DESC LIMIT 15",
       "params": { "windowHours": 24 },
       "notes": [
         "Units are null at ingest: Celsius is an assumption, stated on the answer",

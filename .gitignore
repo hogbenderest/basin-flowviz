@@ -10,3 +10,6 @@ credentials.json
 *.log
 .DS_Store
 worker-configuration.d.ts
+
+# local catalogue overlay: real entity ids/labels, never commit
+src/catalog/catalog.local.json
