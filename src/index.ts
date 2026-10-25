@@ -12,8 +12,10 @@
 //   rejected on the analyzed text. Basin SQL's server-side read-only
 //   enforcement remains the backstop.
 // - POST routes require Content-Type: application/json (blocks CORS
-//   simple-request drive-bys), small bodies, and a same-host Origin when an
-//   Origin header is present.
+//   simple-request drive-bys), bodies read with a streamed byte cap (never
+//   Content-Length-trusting: chunked framing must not defeat the caps -
+//   run-2 audit fix), and a same-host Origin when an Origin header is
+//   present.
 // - The Basin SQL token (R2 Admin R&W) lives only in Worker secrets, is never
 //   logged or returned, and the missing-token 503 does not name it.
 // - `logpush = true` ships console output into cfwork.workers_trace_events:
@@ -78,15 +80,44 @@ function schedulerEnv(env: Env): SchedulerEnv {
 // Request guards
 // ---------------------------------------------------------------------------
 
-// POST routes must be JSON and small. application/json forces a CORS
-// preflight for cross-origin browsers, killing simple-request drive-bys.
-function jsonGuard(req: Request, maxBytes: number): Response | null {
+// POST routes must be JSON. application/json forces a CORS preflight for
+// cross-origin browsers, killing simple-request drive-bys.
+function jsonTypeGuard(req: Request): Response | null {
   const ct = (req.headers.get("Content-Type") || "").toLowerCase();
   if (!ct.includes("application/json"))
     return new Response("expected application/json", { status: 415 });
-  const cl = Number(req.headers.get("Content-Length") || "0");
-  if (cl > maxBytes) return new Response("payload too large", { status: 413 });
   return null;
+}
+
+// Read at most maxBytes of the request body, counting the bytes actually
+// streamed - never trusting the Content-Length header. Chunked/streamed
+// requests carry no Content-Length, which made the old header-based caps
+// a no-op (run-2 audit finding: identical bodies passed with chunked
+// framing).
+async function readBoundedBody(
+  req: Request,
+  maxBytes: number,
+): Promise<string | null> {
+  const reader = req.body?.getReader();
+  if (!reader) return "";
+  const dec = new TextDecoder();
+  let len = 0;
+  let out = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    len += value.byteLength;
+    if (len > maxBytes) {
+      try {
+        await reader.cancel();
+      } catch {
+        /* best-effort */
+      }
+      return null;
+    }
+    out += dec.decode(value, { stream: true });
+  }
+  return out + dec.decode();
 }
 
 // When a browser Origin is present it must match the serving host. Absent
@@ -109,8 +140,7 @@ function originGuard(req: Request): Response | null {
 
 const MAX_RELAY_BYTES = 1024 * 1024;
 
-async function parseRelayBody(req: Request): Promise<any[]> {
-  const text = await req.text();
+function parseRelayBody(text: string): any[] {
   const out: any[] = [];
   try {
     const j = JSON.parse(text);
@@ -221,6 +251,10 @@ async function sseResponse(env: Env): Promise<Response> {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
+      // Blocks cross-site no-cors subresource loads of the SSE stream
+      // (run-2 audit finding: a conscripted browser must not be able to
+      // hold authenticated /events connections open).
+      "Cross-Origin-Resource-Policy": "same-site",
     },
   });
 }
@@ -403,10 +437,10 @@ export default {
       if (!env.RELAY_SECRET || auth !== `Bearer ${env.RELAY_SECRET}`) {
         return new Response("unauthorized", { status: 401 });
       }
-      const cl = Number(req.headers.get("Content-Length") || "0");
-      if (cl > MAX_RELAY_BYTES)
+      const relayText = await readBoundedBody(req, MAX_RELAY_BYTES);
+      if (relayText === null)
         return new Response("payload too large", { status: 413 });
-      const events = await parseRelayBody(req);
+      const events = parseRelayBody(relayText);
       if (events.length) {
         const sample = events.slice(0, 20).map(toTickerEvent);
         await hub(env).push(sample, "lan");
@@ -424,7 +458,15 @@ export default {
       ]);
       return Response.json(
         { bsky, ticker, ts: Date.now() },
-        { headers: { "Cache-Control": "no-store" } },
+        {
+          headers: {
+            "Cache-Control": "no-store",
+            // Blocks cross-site no-cors subresource loads (a conscripted
+            // browser cannot silently spend the owner's cookie on DO
+            // requests; run-2 audit finding).
+            "Cross-Origin-Resource-Policy": "same-site",
+          },
+        },
       );
     }
 
@@ -435,9 +477,17 @@ export default {
     if (path === "/api/bsky/toggle" && req.method === "POST") {
       const og = originGuard(req);
       if (og) return og;
-      const jg = jsonGuard(req, 1024);
+      const jg = jsonTypeGuard(req);
       if (jg) return jg;
-      const body: any = await req.json().catch(() => null);
+      const toggleText = await readBoundedBody(req, 1024);
+      if (toggleText === null)
+        return new Response("payload too large", { status: 413 });
+      let body: any = null;
+      try {
+        body = JSON.parse(toggleText);
+      } catch {
+        body = null;
+      }
       // Absent or non-boolean enabled is a no-op (400), not a forced off.
       if (body === null || typeof body.enabled !== "boolean") {
         return new Response("expected {\"enabled\": boolean}", { status: 400 });
@@ -451,7 +501,7 @@ export default {
     if (path === "/api/sql" && req.method === "POST") {
       const og = originGuard(req);
       if (og) return og;
-      const jg = jsonGuard(req, MAX_QUERY_CHARS + 2048);
+      const jg = jsonTypeGuard(req);
       if (jg) return jg;
       if (!env.BASIN_SQL_TOKEN) {
         // Generic message: never announce which secret is missing.
@@ -463,7 +513,15 @@ export default {
           { status: 503 },
         );
       }
-      const body: any = await req.json().catch(() => ({}));
+      const sqlText = await readBoundedBody(req, MAX_QUERY_CHARS + 2048);
+      if (sqlText === null)
+        return new Response("payload too large", { status: 413 });
+      let body: any = {};
+      try {
+        body = JSON.parse(sqlText);
+      } catch {
+        body = {};
+      }
       const raw = typeof body?.query === "string" ? body.query : "";
       const check = sanitizeSql(raw);
       if (!check.ok) {
@@ -499,10 +557,21 @@ export default {
     if (path === "/api/ask" && req.method === "POST") {
       const og = originGuard(req);
       if (og) return og;
-      const jg = jsonGuard(req, 32768);
+      const jg = jsonTypeGuard(req);
       if (jg) return jg;
+      // Bounded read: never trust Content-Length (run-2 audit finding).
+      const askText = await readBoundedBody(req, 32768);
+      if (askText === null)
+        return new Response("payload too large", { status: 413 });
+      // Re-serialize as a bounded Request so handleAsk keeps its own
+      // body-parsing semantics; headers (session, user identity) carry over.
+      const boundedReq = new Request(req.url, {
+        method: "POST",
+        headers: req.headers,
+        body: askText,
+      });
       try {
-        return await handleAsk(env, req);
+        return await handleAsk(env, boundedReq);
       } catch (e) {
         // Never leak internals; the state machine above covers expected paths.
         return Response.json(
@@ -520,10 +589,19 @@ export default {
     if (path === "/api/scenario" && req.method === "POST") {
       const og = originGuard(req);
       if (og) return og;
-      const jg = jsonGuard(req, 4096);
+      const jg = jsonTypeGuard(req);
       if (jg) return jg;
+      // Bounded read: never trust Content-Length (run-2 audit finding).
+      const scenarioText = await readBoundedBody(req, 4096);
+      if (scenarioText === null)
+        return new Response("payload too large", { status: 413 });
+      const boundedReq = new Request(req.url, {
+        method: "POST",
+        headers: req.headers,
+        body: scenarioText,
+      });
       try {
-        return await handleScenario(env, req);
+        return await handleScenario(env, boundedReq);
       } catch {
         return Response.json(
           { error: "scenario service error" },
@@ -547,9 +625,18 @@ export default {
     if (ackMatch && req.method === "POST") {
       const og = originGuard(req);
       if (og) return og;
-      const jg = jsonGuard(req, 1024);
+      const jg = jsonTypeGuard(req);
       if (jg) return jg;
-      return ackInvestigation(env, ackMatch[1], req);
+      // Bounded read: never trust Content-Length (run-2 audit finding).
+      const ackText = await readBoundedBody(req, 1024);
+      if (ackText === null)
+        return new Response("payload too large", { status: 413 });
+      const boundedReq = new Request(req.url, {
+        method: "POST",
+        headers: req.headers,
+        body: ackText,
+      });
+      return ackInvestigation(env, ackMatch[1], boundedReq);
     }
 
     return env.ASSETS.fetch(req);

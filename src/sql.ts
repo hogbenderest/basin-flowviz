@@ -130,11 +130,30 @@ export function sanitizeSql(raw: string): SqlCheck {
   // same string, so no comment or literal can hide live SQL from the checks.
   let q = bare;
   if (/^(select|with)\b/i.test(head)) {
-    const limitRe = /\blimit\s+(\d+)\b/ig;
-    let m: RegExpExecArray | null;
-    while ((m = limitRe.exec(analysis)) !== null) {
-      if (parseInt(m[1], 10) > MAX_LIMIT)
+    // Strict LIMIT validation: the engine's grammar accepts forms the old
+    // regex did not model - the MySQL comma form "LIMIT offset, count"
+    // (the guard validated the first number while the engine used the
+    // second as the count), scientific notation, and LIMIT ALL. Any LIMIT
+    // expression that is not plain integers in an accepted shape is
+    // rejected outright (run-2 audit finding, re-applied 2026-10-24).
+    const LIMIT_CLAUSE_RE = /\blimit\b([^()]*)/gi;
+    let lm: RegExpExecArray | null;
+    while ((lm = LIMIT_CLAUSE_RE.exec(analysis)) !== null) {
+      const cm = lm[1]
+        .trim()
+        .match(/^(\d+)(?:\s*,\s*(\d+))?(?:\s+offset\s+(\d+))?\s*$/i);
+      if (!cm)
+        return { ok: false, error: "Unsupported LIMIT syntax in the console." };
+      // Single number = the row count; comma form = offset, count (engine
+      // semantics, live-verified). The effective count must respect the cap.
+      const count = cm[2] ? parseInt(cm[2], 10) : parseInt(cm[1], 10);
+      if (count > MAX_LIMIT)
         return { ok: false, error: `LIMIT is capped at ${MAX_LIMIT}.` };
+      // In the comma form the first number is an offset.
+      if (cm[2] && parseInt(cm[1], 10) > MAX_OFFSET)
+        return { ok: false, error: `OFFSET is capped at ${MAX_OFFSET}.` };
+      if (cm[3] && parseInt(cm[3], 10) > MAX_OFFSET)
+        return { ok: false, error: `OFFSET is capped at ${MAX_OFFSET}.` };
     }
     const off = analysis.match(OFFSET_ANY_RE);
     if (off && parseInt(off[1], 10) > MAX_OFFSET)

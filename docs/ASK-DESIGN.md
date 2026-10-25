@@ -1,10 +1,8 @@
 # Ask and Investigations: design notes for operators
 
 This documents the second-generation surface added on top of the flow map:
-the Ask bar, the governed query service, and the investigation layer. The
-engineering plan of record lives at
-`/Users/ian/.opencode/plan/basin-flowviz-next-evolution.md` (finalised
-24 October 2026). Read this file for day-2 operation.
+the Ask bar, the governed query service, and the investigation layer.
+Read this file for day-2 operation.
 
 ## Surfaces
 
