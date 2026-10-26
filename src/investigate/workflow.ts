@@ -7,9 +7,11 @@
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 import { executeGoverned, snapshotEvidence } from "../query/service";
+import { sqlLit } from "../sql";
 import { catalog } from "../catalog/render";
 import type { EvidenceRecord, Finding, InvestigationReport } from "../catalog/types";
 import type { SchedulerEnv } from "./detectors";
+import { detectorDef } from "./detectors";
 import { extractModelText } from "../ask/planner";
 import { recordAiUsage } from "../stats/collectors";
 
@@ -22,6 +24,20 @@ export interface DnsVolumeParams {
   baselineHourly: number;
   windowMinutes: number;
   detectedAt: string;
+}
+
+// Round 5: the registry payload. New detectors (including new-shape
+// dns-volume instances) carry their aggregate candidate record; the
+// workflow dispatches by detectorId. Legacy in-flight dns-volume
+// instances keep the DnsVolumeParams shape and are normalized on entry.
+export interface InvestigationParams {
+  detectorId: string;
+  severity?: string;
+  incidentKey?: string;
+  windowFrom: string;
+  windowTo: string;
+  detectedAt: string;
+  candidate: Record<string, unknown>;
 }
 
 const COVERAGE_MARGIN_MS = 3 * 60_000;
@@ -44,9 +60,10 @@ async function evidenceStep(
   sql: string,
   kind: EvidenceRecord["kind"],
   skipExplain = false,
+  primaryTable = "homelab.dns_queries",
 ): Promise<StepRows> {
   const out = await executeGoverned(env, "investigation", sql, {
-    primaryTable: "homelab.dns_queries",
+    primaryTable,
     skipExplain,
   });
   if (!out.ok) return { rows: [], sql, evidenceId: null, rowCount: 0, error: out.error };
@@ -59,10 +76,40 @@ async function evidenceStep(
   };
 }
 
-export class InvestigationWorkflow extends WorkflowEntrypoint<SchedulerEnv, DnsVolumeParams> {
-  async run(event: WorkflowEvent<DnsVolumeParams>, step: WorkflowStep): Promise<void> {
+export class InvestigationWorkflow extends WorkflowEntrypoint<
+  SchedulerEnv,
+  DnsVolumeParams | InvestigationParams
+> {
+  async run(
+    event: WorkflowEvent<DnsVolumeParams | InvestigationParams>,
+    step: WorkflowStep,
+  ): Promise<void> {
     const env = this.env as SchedulerEnv;
-    const p = event.payload;
+    const raw = event.payload as unknown as Record<string, unknown>;
+    const detectorId = String(raw.detectorId ?? "dns-volume");
+    const cand = (raw.candidate ?? {}) as Record<string, unknown>;
+    if (detectorId !== "dns-volume" || raw.clientHash === undefined) {
+      return this.genericPlaybook(
+        env,
+        raw as unknown as InvestigationParams,
+        step,
+      );
+    }
+    // Normalized legacy/new dns-volume shape (behavior identical).
+    const p: DnsVolumeParams = {
+      detectorId: "dns-volume",
+      clientHash: String(raw.clientHash ?? cand.clientHash ?? ""),
+      windowFrom: String(raw.windowFrom ?? ""),
+      windowTo: String(raw.windowTo ?? ""),
+      candidateCount: Number(raw.candidateCount ?? cand.candidateCount ?? 0),
+      baselineHourly: Number(raw.baselineHourly ?? cand.baselineHourly ?? 0),
+      windowMinutes: Number(raw.windowMinutes ?? cand.windowMinutes ?? 0),
+      detectedAt: String(raw.detectedAt ?? new Date().toISOString()),
+    };
+    return this.dnsVolume(env, p, step);
+  }
+
+  private async dnsVolume(env: SchedulerEnv, p: DnsVolumeParams, step: WorkflowStep): Promise<void> {
 
     // Step 1: coverage. An empty or lagging window is NOT evidence of absence
     // (plan 7.1): wait bounded for the window to become queryable.
@@ -209,6 +256,446 @@ export class InvestigationWorkflow extends WorkflowEntrypoint<SchedulerEnv, DnsV
         await deliverReport(env, p);
       },
     );
+  }
+
+  // ---------------------------------------------------------------------
+  // Round 5: the registry playbook for every non-dns-volume detector.
+  // Bounded coverage + aggregate-only evidence (never raw message bodies),
+  // deterministic synthesis (the model is not needed for these shapes),
+  // and the same append-only persistence as dns-volume.
+  // ---------------------------------------------------------------------
+  private async genericPlaybook(
+    env: SchedulerEnv,
+    p: InvestigationParams,
+    step: WorkflowStep,
+  ): Promise<void> {
+    const def = detectorDef(p.detectorId);
+    if (!def) return;
+    const c = p.candidate ?? {};
+
+    let coverageOk = true;
+    const primaryTable = def.primaryTable;
+    if (primaryTable) {
+      const cov = await step.do("coverage", async () => {
+        const out = await executeGoverned(
+          env,
+          "investigation",
+          `SELECT MAX(__ingest_ts) AS m FROM ${primaryTable} WHERE __ingest_ts >= '${p.windowTo}'`,
+          { primaryTable, skipExplain: true },
+        );
+        if (!out.ok) return { ok: false };
+        const m = String((out.result.rows[0] as { m?: string })?.m ?? "");
+        return { ok: Boolean(m && Date.parse(m) >= Date.parse(p.windowTo) - 3 * 60_000) };
+      });
+      coverageOk = cov.ok;
+    }
+
+    const steps = genericEvidenceSteps(p, def);
+    const collected: { name: string; rows: StepRows["rows"]; step: StepRows }[] = [];
+    if (steps.length === 0) {
+      // Meta-driven detector: the candidate aggregate IS the evidence.
+      const s = await step.do("evidence-candidate", async () =>
+        candidateEvidence(env, p),
+      );
+      collected.push({ name: "candidate", rows: s.rows, step: s });
+    } else {
+      for (const e of steps) {
+        const s = await step.do(`evidence-${e.name}`, () =>
+          evidenceStep(env, e.sql, "query", true, primaryTable ?? undefined),
+        );
+        collected.push({ name: e.name, rows: s.rows, step: s });
+      }
+    }
+
+    const synthesis = await step.do("synthesis", async () =>
+      genericSynthesis(p, def, c, coverageOk),
+    );
+
+    await step.do("persist-report", async () => {
+      const evidence: EvidenceRecord[] = [];
+      const evidenceByKind: Record<string, EvidenceRecord | null> = {};
+      for (const col of collected) {
+        if (col.step.evidenceId) {
+          const rec: EvidenceRecord = {
+            id: col.step.evidenceId,
+            kind: "query",
+            sql: col.step.sql,
+            requestId: "workflow",
+            rowCount: col.step.rowCount,
+            truncated: false,
+            createdAt: new Date().toISOString(),
+          };
+          evidence.push(rec);
+          evidenceByKind[col.name] = rec;
+        }
+      }
+      const report = assembleGenericReport(p, def, {
+        evidence,
+        evidenceByKind,
+        synthesis,
+        coverageOk,
+        collected,
+      });
+      await persistReport(env, report);
+      await deliverGeneric(env, report, p);
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Round 5 generic playbook helpers
+// ---------------------------------------------------------------------------
+
+interface GenericEvidence {
+  name: string;
+  sql: string;
+}
+
+// Aggregate-only evidence SQL per detector (run-5 challenger P0: raw
+// message bodies never reach evidence or the model).
+const WIFI_SIG_SQL = `TRY_CAST(regexp_replace(fields, '^.*"value":(-?[0-9.]+).*$', '$1') AS DOUBLE)`;
+
+function genericEvidenceSteps(p: InvestigationParams, def: NonNullable<ReturnType<typeof detectorDef>>): GenericEvidence[] {
+  const c = p.candidate ?? {};
+  switch (def.id) {
+    case "ssh-brute-force": {
+      const host = sqlLit(String(c.host ?? ""));
+      return [
+        {
+          name: "auth-hourly-24h",
+          sql:
+            `SELECT date_trunc('hour', ts) AS h, ` +
+            `SUM(CASE WHEN message ILIKE '%failed password%' OR message ILIKE '%invalid user%' THEN 1 ELSE 0 END) AS fails, ` +
+            `SUM(CASE WHEN message ILIKE '%accepted password%' OR message ILIKE '%accepted publickey%' THEN 1 ELSE 0 END) AS oks ` +
+            `FROM homelab.syslog WHERE host = ${host} AND __ingest_ts >= now() - INTERVAL '24 hours' ` +
+            `GROUP BY 1 ORDER BY h LIMIT 30`,
+        },
+      ];
+    }
+    case "host-distress": {
+      const host = sqlLit(String(c.host ?? ""));
+      return [
+        {
+          name: "distress-hourly-24h",
+          sql:
+            `SELECT date_trunc('hour', ts) AS h, ` +
+            `SUM(CASE WHEN message ILIKE '%out of memory%' OR message ILIKE '%killed process%' THEN 1 ELSE 0 END) AS oom, ` +
+            `SUM(CASE WHEN message ILIKE '%main process exited%' OR message ILIKE '%failed to start%' OR message ILIKE '%scheduled restart%' THEN 1 ELSE 0 END) AS distress ` +
+            `FROM homelab.syslog WHERE host = ${host} AND __ingest_ts >= now() - INTERVAL '24 hours' ` +
+            `GROUP BY 1 ORDER BY h LIMIT 30`,
+        },
+      ];
+    }
+    case "worker-errors":
+      return [
+        {
+          name: "outcomes-6h",
+          sql:
+            `SELECT "Outcome", COUNT(*) AS c FROM cfwork.workers_trace_events ` +
+            `WHERE __ingest_ts >= now() - INTERVAL '6 hours' GROUP BY "Outcome" LIMIT 20`,
+        },
+        {
+          name: "hourly-24h",
+          sql:
+            `SELECT date_trunc('hour', __ingest_ts) AS h, ` +
+            `SUM(CASE WHEN "Outcome" != 'ok' THEN 1 ELSE 0 END) AS bad, COUNT(*) AS total ` +
+            `FROM cfwork.workers_trace_events WHERE __ingest_ts >= now() - INTERVAL '24 hours' ` +
+            `GROUP BY 1 ORDER BY h LIMIT 30`,
+        },
+      ];
+    case "wifi-degradation": {
+      const scope = String(c.scope ?? "client");
+      const where =
+        scope === "ap"
+          ? `host = ${sqlLit(String(c.ap ?? ""))} AND fields ILIKE '%wifi_ap_radio%'`
+          : `host = ${sqlLit(String(c.client ?? ""))} AND fields ILIKE '%wifi_client%'`;
+      return [
+        {
+          name: "hourly-24h",
+          sql:
+            `SELECT date_trunc('hour', ts) AS h, ROUND(AVG(${WIFI_SIG_SQL}), 1) AS v, COUNT(*) AS n ` +
+            `FROM homelab.host_metrics WHERE ${where} AND __ingest_ts >= now() - INTERVAL '24 hours' ` +
+            `GROUP BY 1 ORDER BY h LIMIT 30`,
+        },
+      ];
+    }
+    default:
+      return [];
+  }
+}
+
+// Meta-driven detectors (telemetry-blind-spot) never query Basin: the
+// candidate aggregate itself is snapshotted as evidence.
+async function candidateEvidence(env: SchedulerEnv, p: InvestigationParams): Promise<StepRows> {
+  const rows = [p.candidate as unknown as JsonRow];
+  const rec = await snapshotEvidence(env, {
+    sql: "-- meta-driven detector: no warehouse query; the candidate aggregate is the evidence",
+    result: {
+      requestId: "workflow-meta",
+      schema: [{ name: "field", type: "json" }],
+      rows: rows as unknown as Record<string, unknown>[],
+      metrics: { bytesScanned: 0, filesScanned: 0 },
+      truncation: { applied: false },
+      freshness: { completeness: "unknown" as const },
+    },
+    kind: "coverage",
+  });
+  return {
+    rows,
+    sql: "-- meta-driven detector: no warehouse query",
+    evidenceId: rec.id,
+    rowCount: rows.length,
+  };
+}
+
+function genericSynthesis(
+  p: InvestigationParams,
+  def: NonNullable<ReturnType<typeof detectorDef>>,
+  c: Record<string, unknown>,
+  coverageOk: boolean,
+): SynthesisResult {
+  const N = (k: string) => Number(c[k] ?? 0);
+  const S = (k: string) => String(c[k] ?? "");
+  const gapNote = coverageOk ? [] : ["window coverage was incomplete when the candidate was scanned"];
+  switch (def.id) {
+    case "ssh-brute-force": {
+      const escalated = Boolean(c.escalated);
+      return {
+        classification: escalated ? "suspicious" : "inconclusive",
+        confidence: escalated ? "medium" : "low",
+        summary:
+          `${N("authFail")} authentication failures on ${S("host")} in the detection window` +
+          (escalated ? `, followed by at least one accepted login: possible successful access` : ` with no observed accepted login`),
+        findings: [
+          {
+            statement: `${N("authFail")} failed and ${N("authOk")} accepted auth lines on ${S("host")}`,
+            evidenceKind: "auth-hourly-24h",
+            classification: "supported",
+          },
+        ],
+        uncertainty: [...gapNote, "auth lines carry host but not source address: attribution is correlation, not identity"],
+        nextSteps: escalated
+          ? ["check last logins on the host now", "review authorized_keys and recent sessions", "rotate credentials if the accepted login is unexplained"]
+          : ["watch for further failures from the same host", "verify whether the host is reachable from outside"],
+        usedModel: false,
+      };
+    }
+    case "host-distress":
+      return {
+        classification: "informational",
+        confidence: "medium",
+        summary:
+          `${N("oom")} memory-kill pattern matches and ${N("distress")} service-distress lines on ${S("host")}; ` +
+          `this is a host health incident, not an intrusion indicator`,
+        findings: [
+          {
+            statement: `${N("oom")} OOM patterns, ${N("distress")} service failure/restart lines on ${S("host")}`,
+            evidenceKind: "distress-hourly-24h",
+            classification: "supported",
+          },
+        ],
+        uncertainty: [...gapNote, "log lines are conflated across journald, docker and remote syslog for this host"],
+        nextSteps: [
+          "inspect the host's service state and memory",
+          "check whether a deploy or restart was expected at this time",
+        ],
+        usedModel: false,
+      };
+    case "worker-errors":
+      return {
+        classification: "informational",
+        confidence: "medium",
+        summary: `${N("bad")} non-ok Worker outcomes in the window (${Object.entries((c.breakdown ?? {}) as Record<string, number>).map(([k, v]) => `${k}:${v}`).join(", ")}); the app's own invocations degraded`,
+        findings: [
+          {
+            statement: `${N("bad")} non-ok outcomes in the detection window`,
+            evidenceKind: "hourly-24h",
+            classification: "supported",
+          },
+        ],
+        uncertainty: [...gapNote, "canceled outcomes are expected during deploys"],
+        nextSteps: ["check the Worker's recent deploys", "inspect invocation errors in the trace table"],
+        usedModel: false,
+      };
+    case "telemetry-blind-spot":
+      return {
+        classification: "inconclusive",
+        confidence: "high",
+        summary: `telemetry blind spot: ${S("detail")} (source: ${S("source")}); detections over this source are blind until it recovers`,
+        findings: [
+          {
+            statement: S("detail") || "a monitored source stopped reporting",
+            evidenceKind: "candidate",
+            classification: "supported",
+          },
+        ],
+        uncertainty: ["absence of telemetry is not absence of events (plan 7.1)"],
+        nextSteps: ["check the pipeline on the affected host", "verify Vector is running on server111"],
+        usedModel: false,
+      };
+    case "wifi-degradation": {
+      const scope = String(c.scope ?? "client");
+      const target = scope === "ap" ? S("ap") : S("client");
+      return {
+        classification: "informational",
+        confidence: "medium",
+        summary:
+          scope === "ap"
+            ? `AP ${target} averaged ${N("avgCuTotal")}% channel utilisation in the window: airtime saturation`
+            : `client ${target} averaged ${N("avgSignal")} dBm in the window: weak or degraded link`,
+        findings: [
+          {
+            statement:
+              scope === "ap"
+                ? `${N("avgCuTotal")}% average channel utilisation on ${target}`
+                : `${N("avgSignal")} dBm average signal on ${target}`,
+            evidenceKind: "hourly-24h",
+            classification: "supported",
+          },
+        ],
+        uncertainty: [...gapNote, "60 s sampling misses fast fades; PHY rate is not throughput"],
+        nextSteps:
+          scope === "ap"
+            ? ["check for new interference sources on the channel", "consider channel planning changes"]
+            : ["check the device's distance from its AP", "watch for retry growth on this client"],
+        usedModel: false,
+      };
+    }
+    default:
+      return {
+        classification: "inconclusive",
+        confidence: "low",
+        summary: `detector ${def.id} fired; no canned synthesis`,
+        findings: [],
+        uncertainty: ["no template for this detector"],
+        nextSteps: [],
+        usedModel: false,
+      };
+  }
+}
+
+function assembleGenericReport(
+  p: InvestigationParams,
+  def: NonNullable<ReturnType<typeof detectorDef>>,
+  ctx: {
+    evidence: EvidenceRecord[];
+    evidenceByKind: Record<string, EvidenceRecord | null>;
+    synthesis: SynthesisResult;
+    coverageOk: boolean;
+    collected: { name: string; rows: StepRows["rows"] }[];
+  },
+): InvestigationReport {
+  const evidenceFor = (kind: string): string[] => {
+    const rec = ctx.evidenceByKind[kind];
+    return rec ? [rec.id] : ctx.evidence[0] ? [ctx.evidence[0].id] : [];
+  };
+  const findings: Finding[] = ctx.synthesis.findings.map((f, i) => ({
+    id: `f${i + 1}`,
+    statement: f.statement,
+    evidence: evidenceFor(f.evidenceKind),
+    classification: f.classification,
+  }));
+  const timeline = (ctx.collected[0]?.rows ?? []).slice(0, 30).map((r) => ({
+    ts: String((r as Record<string, unknown>).h ?? (r as Record<string, unknown>).m ?? p.windowFrom),
+    source: def.primaryTable ?? "meta",
+    description: `${Number((r as Record<string, unknown>).v ?? (r as Record<string, unknown>).bad ?? (r as Record<string, unknown>).fails ?? (r as Record<string, unknown>).c ?? 0)} observed`,
+  }));
+  const key = p.incidentKey ?? `${def.id}:${p.detectedAt}`;
+  const safeKey = key.replace(/[^a-z0-9-]/gi, "").slice(-24);
+  return {
+    schemaVersion: 1,
+    id: `rpt-${p.detectedAt.slice(0, 10)}-${def.id}-${safeKey}`,
+    incidentKey: key,
+    playbook: def.id,
+    trigger: {
+      detectedAtUTC: p.detectedAt,
+      detectorId: def.id,
+      candidate: p.candidate,
+    },
+    conclusion: {
+      classification: ctx.coverageOk
+        ? ctx.synthesis.classification
+        : ctx.synthesis.classification === "informational"
+          ? "inconclusive"
+          : ctx.synthesis.classification,
+      confidence: ctx.synthesis.confidence,
+      summary: ctx.synthesis.summary,
+    },
+    scope: {
+      fromUTC: p.windowFrom,
+      toUTC: p.windowTo,
+      entities: [String(p.candidate?.host ?? p.candidate?.client ?? p.candidate?.ap ?? p.candidate?.source ?? def.id)],
+    },
+    timeline,
+    observations: findings,
+    hypotheses: [
+      {
+        name: def.id,
+        verdict: findings[0] ?? { id: "f1", statement: "Inspection pending", evidence: [], classification: "unresolved" },
+        alternativesTested: [],
+      },
+    ],
+    coverage: [
+      {
+        table: def.primaryTable ?? "meta",
+        windowRows: timeline.length,
+        gaps: ctx.coverageOk ? [] : ["window coverage was incomplete when evidence was gathered"],
+      },
+    ],
+    uncertainty: ctx.synthesis.uncertainty,
+    nextSteps: ctx.synthesis.nextSteps,
+    charts: timeline.length
+      ? [
+          {
+            type: "time-series",
+            title: `${def.id} (24h, hourly)`,
+            x: "h",
+            y: "v",
+            missingDataPolicy: "gap",
+            timeWindow: { fromUTC: p.windowFrom, toUTC: p.windowTo },
+          },
+        ]
+      : [],
+    provenance: {
+      queryIds: ctx.evidence.map((e) => e.id),
+      modelCalls: [],
+    },
+    createdAtUTC: new Date().toISOString(),
+    version: 1,
+    severity: (p.severity as InvestigationReport["severity"]) ?? def.severity,
+    mitreTag: def.mitreTag,
+  };
+}
+
+async function deliverGeneric(
+  env: SchedulerEnv,
+  report: InvestigationReport,
+  p: InvestigationParams,
+): Promise<void> {
+  if (!env.REPORTS_D1) return;
+  await env.REPORTS_D1.prepare(
+    "INSERT OR IGNORE INTO deliveries (report_id, report_version, channel, status, delivered_at, attempts) " +
+      "VALUES (?1, 1, 'inbox', 'delivered', ?2, 1)",
+  )
+    .bind(report.id, new Date().toISOString())
+    .run();
+  if (!env.WEBHOOK_URL || !env.WEBHOOK_SECRET) return;
+  try {
+    await fetch(env.WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${env.WEBHOOK_SECRET}` },
+      body: JSON.stringify({
+        type: "investigation.completed",
+        report: report.id,
+        playbook: report.playbook,
+        severity: report.severity,
+        windowFrom: p.windowFrom,
+        windowTo: p.windowTo,
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch {
+    /* inbox remains the primary channel */
   }
 }
 
@@ -474,9 +961,10 @@ async function persistReport(env: SchedulerEnv, report: InvestigationReport): Pr
   }
   if (env.REPORTS_D1) {
     await env.REPORTS_D1.prepare(
-      "INSERT INTO reports (id, incident_key, playbook, status, classification, confidence, latest_version, r2_key, created_at, updated_at, last_seen_at) " +
-        "VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6, ?7, ?8, ?8, ?8) " +
-        "ON CONFLICT (id) DO UPDATE SET latest_version = ?6, classification = ?4, confidence = ?5, updated_at = ?8",
+      "INSERT INTO reports (id, incident_key, playbook, status, classification, confidence, severity, mitre_tag, latest_version, r2_key, created_at, updated_at, last_seen_at) " +
+        "VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10) " +
+        "ON CONFLICT (id) DO UPDATE SET latest_version = ?8, classification = ?4, confidence = ?5, " +
+        "severity = ?6, mitre_tag = ?7, updated_at = ?10",
     )
       .bind(
         report.id,
@@ -484,6 +972,8 @@ async function persistReport(env: SchedulerEnv, report: InvestigationReport): Pr
         report.playbook,
         report.conclusion.classification,
         report.conclusion.confidence,
+        report.severity ?? "medium",
+        report.mitreTag ?? null,
         report.version,
         key,
         report.createdAtUTC,

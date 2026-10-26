@@ -507,3 +507,23 @@ body.scoped #edges path.edge-hover { opacity: 1; stroke: var(--orange-dim); }
 /* run-5: commit-state on live lines - orange timestamp until the
    archive row is queryable (~2 min pipeline lag), gray after */
 #ticker-list li.pending .ticker-ts { color: var(--orange); }
+
+
+/* ---------- run-5: analyst triage ---------- */
+
+.sev-badge {
+  font-size: 10px; font-weight: 700; border-radius: 999px; padding: 1px 8px;
+  text-transform: uppercase; flex-shrink: 0;
+}
+.sev-badge.critical { background: rgba(255, 107, 107, 0.2); color: #ff6b6b; }
+.sev-badge.high { background: rgba(246, 130, 31, 0.18); color: var(--orange); }
+.sev-badge.medium { background: rgba(74, 163, 255, 0.16); color: var(--blue); }
+.sev-badge.low { background: rgba(139, 147, 167, 0.16); color: var(--muted); }
+.mitre-chip {
+  font-size: 10px; font-weight: 700; border: 1px solid var(--purple);
+  color: var(--purple); border-radius: 6px; padding: 1px 6px; flex-shrink: 0;
+}
+.coverage-card {
+  border: 1px solid var(--card-border); border-radius: 8px;
+  padding: 10px; background: var(--card); margin-top: 8px;
+}

@@ -480,6 +480,7 @@ window.FlowvizAsk = (() => {
     list.innerHTML = "";
     const d = await jfetch("/api/investigations");
     const reports = d.reports || [];
+    const coverage = d.coverage || null;
     if (!reports.length) {
       const e = document.createElement("div");
       e.className = "ask-note";
@@ -495,12 +496,28 @@ window.FlowvizAsk = (() => {
       const cls = document.createElement("span");
       cls.className = "state-badge " + (r.classification || "open");
       cls.textContent = r.classification || r.status;
+      const sev = document.createElement("span");
+      sev.className = "sev-badge " + (r.severity || "medium");
+      sev.textContent = r.severity || "medium";
+      const mitre = r.mitre_tag
+        ? (() => {
+            const t = document.createElement("span");
+            t.className = "mitre-chip";
+            t.textContent = r.mitre_tag;
+            t.title = "MITRE ATT&CK technique";
+            return t;
+          })()
+        : null;
       const meta = document.createElement("span");
-      meta.textContent = `${r.playbook} - ${awst(r.updated_at)} AWST`;
-      row.append(cls, meta);
+      const disp = r.disposition && r.disposition !== "unactioned" ? ` [${r.disposition}]` : "";
+      meta.textContent = `${r.playbook}${disp} - ${awst(r.updated_at)} AWST`;
+      row.append(cls, sev);
+      if (mitre) row.append(mitre);
+      row.append(meta);
       row.addEventListener("click", () => openReport(r.id));
       list.appendChild(row);
     }
+    renderCoverageCard(d.coverage, list);
   }
 
   async function openReport(id) {
@@ -612,6 +629,96 @@ window.FlowvizAsk = (() => {
       $("inbox-list").classList.remove("hidden");
     });
     holder.appendChild(ack);
+
+    // Round 5: analyst disposition (a triage record, independent of
+    // read/closed status).
+    const triageRow = document.createElement("div");
+    triageRow.style.display = "flex";
+    triageRow.style.gap = "6px";
+    triageRow.style.flexWrap = "wrap";
+    const triageLabel = document.createElement("span");
+    triageLabel.className = "report-conf";
+    triageLabel.textContent = "disposition:";
+    triageRow.appendChild(triageLabel);
+    for (const d of ["true-positive", "false-positive", "acknowledged"]) {
+      const b = document.createElement("button");
+      b.className = "btn small";
+      b.textContent = d;
+      b.addEventListener("click", async () => {
+        await post(`/api/investigations/${id}/triage`, { disposition: d });
+        await refreshInbox();
+        await openReport(id);
+      });
+      triageRow.appendChild(b);
+    }
+    holder.appendChild(triageRow);
+  }
+
+  // ------------------------------------------------------------------
+  // coverage card (run-5): what is watched, what is gated, what is blind
+  // ------------------------------------------------------------------
+
+  function renderCoverageCard(coverage, list) {
+    if (!coverage || !list) return;
+    const card = document.createElement("div");
+    card.className = "coverage-card";
+    const h = document.createElement("div");
+    h.className = "tl-src";
+    h.textContent = "detector coverage";
+    card.appendChild(h);
+    const rows = document.createElement("div");
+    rows.style.display = "flex";
+    rows.style.flexDirection = "column";
+    rows.style.gap = "2px";
+    for (const d of coverage.detectors || []) {
+      const row = document.createElement("div");
+      row.className = "tl-row";
+      const name = document.createElement("span");
+      name.textContent = d.id;
+      name.style.flex = "0 0 150px";
+      const st = document.createElement("span");
+      st.className = "state-badge " + (d.runStatus === "active" ? "benign" : d.runStatus === "gated" ? "off" : d.runStatus === "error" ? "suspicious" : "informational");
+      st.textContent = d.runStatus;
+      const note = document.createElement("span");
+      note.className = "tl-what";
+      note.textContent = d.gatedNote
+        ? d.gatedNote
+        : d.lastRunAt
+          ? `last scan ${awst(d.lastRunAt)} AWST`
+          : "awaiting first scan";
+      row.append(name, st, note);
+      rows.appendChild(row);
+    }
+    card.appendChild(rows);
+    const bh = document.createElement("div");
+    bh.className = "tl-src";
+    bh.style.marginTop = "8px";
+    bh.textContent = "blind spots (honest limits)";
+    card.appendChild(bh);
+    const bl = document.createElement("div");
+    bl.className = "ask-notes";
+    for (const b of coverage.blindSpots || []) {
+      const li = document.createElement("div");
+      li.textContent = "- " + b;
+      bl.appendChild(li);
+    }
+    card.appendChild(bl);
+    const driftBad = (coverage.drift || []).filter((x) => !x.ok);
+    if (driftBad.length) {
+      const dh = document.createElement("div");
+      dh.className = "tl-src";
+      dh.style.color = "#ff6b6b";
+      dh.style.marginTop = "8px";
+      dh.textContent = "schema drift";
+      card.appendChild(dh);
+      for (const t of driftBad) {
+        const li = document.createElement("div");
+        li.className = "ask-note";
+        li.textContent = `${t.table_id}: ${t.detail || "drift"}`;
+        card.appendChild(li);
+      }
+    }
+    list.appendChild(card);
   }
 
   // ------------------------------------------------------------------

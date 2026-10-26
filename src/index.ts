@@ -35,7 +35,7 @@ import {
 } from "./sql";
 import type { SqlEnv } from "./sql";
 import { handleAsk, handleCatalog, handleEvidenceRows, userOf } from "./ask/handlers";
-import { runDetectors, runDriftCheck, type SchedulerEnv } from "./investigate/detectors";
+import { runDetectors, runDriftCheck, DETECTORS, BLIND_SPOTS, type SchedulerEnv } from "./investigate/detectors";
 import { checkBudget, recordScan, executeGoverned } from "./query/service";
 import { getHeaderStats, runHeaderCollectors } from "./stats/collectors";
 import type { ServiceEnv } from "./bindings";
@@ -144,6 +144,9 @@ function originGuard(req: Request): Response | null {
 // ---------------------------------------------------------------------------
 
 const MAX_RELAY_BYTES = 1024 * 1024;
+// Relay heartbeat (run-5): throttled per isolate, see the /relay handler.
+let relayHeartbeatAt = 0;
+const RELAY_META_PERIOD_MS = 5 * 60_000;
 
 function parseRelayBody(text: string): any[] {
   const out: any[] = [];
@@ -333,7 +336,7 @@ async function listInvestigations(env: Env): Promise<Response> {
     );
   }
   const { results } = await env.REPORTS_D1.prepare(
-    "SELECT id, incident_key, playbook, status, classification, confidence, latest_version, created_at, updated_at " +
+    "SELECT id, incident_key, playbook, status, classification, confidence, severity, mitre_tag, disposition, latest_version, created_at, updated_at " +
       "FROM reports ORDER BY updated_at DESC LIMIT 50",
   ).all<{
     id: string;
@@ -342,12 +345,52 @@ async function listInvestigations(env: Env): Promise<Response> {
     status: string;
     classification: string | null;
     confidence: string | null;
+    severity: string | null;
+    mitre_tag: string | null;
+    disposition: string | null;
     latest_version: number;
     created_at: string;
     updated_at: string;
   }>();
+  // Coverage card (run-5): detector registry state + drift + blind spots.
+  const d1 = env.REPORTS_D1;
+  const detectorList = DETECTORS.map((d) => ({
+    id: d.id,
+    mitreTag: d.mitreTag,
+    enabled: d.enabled,
+    gatedNote: d.gatedNote ?? null,
+  }));
+  let watermarkRows: { detector_id: string; window_end: string; updated_at: string; status: string | null }[] = [];
+  let driftRows: { table_id: string; ok: number; detail: string | null }[] = [];
+  try {
+    const wm = await d1.prepare(
+      "SELECT detector_id, window_end, updated_at, status FROM watermarks",
+    ).all<{ detector_id: string; window_end: string; updated_at: string; status: string | null }>();
+    watermarkRows = (wm.results ?? []) as typeof watermarkRows;
+    const dr = await d1.prepare("SELECT table_id, ok, detail FROM drift_flags").all<{
+      table_id: string;
+      ok: number;
+      detail: string | null;
+    }>();
+    driftRows = (dr.results ?? []) as typeof driftRows;
+  } catch {
+    /* coverage is best-effort */
+  }
+  const coverage = {
+    detectors: detectorList.map((d) => {
+      const wm = watermarkRows.find((w) => w.detector_id === d.id);
+      return {
+        ...d,
+        lastWindowEnd: wm?.window_end ?? null,
+        lastRunAt: wm?.updated_at ?? null,
+        runStatus: d.enabled ? wm?.status ?? "pending" : "gated",
+      };
+    }),
+    drift: driftRows,
+    blindSpots: BLIND_SPOTS,
+  };
   return Response.json(
-    { reports: results ?? [] },
+    { reports: results ?? [], coverage },
     { headers: { "Cache-Control": "no-store" } },
   );
 }
@@ -368,6 +411,36 @@ async function getInvestigation(env: Env, id: string): Promise<Response> {
   return new Response(body, {
     headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
   });
+}
+
+// Round 5: disposition is a human triage record, deliberately separate
+// from status (which stays the read/unread/closed flag).
+const DISPOSITIONS = new Set(["unactioned", "acknowledged", "true-positive", "false-positive"]);
+
+async function triageInvestigation(env: Env, id: string, req: Request): Promise<Response> {
+  if (!/^[a-z0-9-_.]{1,64}$/i.test(id) || !env.REPORTS_D1) {
+    return Response.json({ error: "not found" }, { status: 404 });
+  }
+  let body: { disposition?: unknown } = {};
+  try {
+    body = (await req.json()) as { disposition?: unknown };
+  } catch {
+    /* empty body allowed */
+  }
+  const disposition = typeof body.disposition === "string" ? body.disposition : "";
+  if (!DISPOSITIONS.has(disposition)) {
+    return Response.json(
+      { error: "expected disposition: unactioned|acknowledged|true-positive|false-positive" },
+      { status: 400 },
+    );
+  }
+  await env.REPORTS_D1.prepare("UPDATE reports SET disposition = ?2, updated_at = ?3 WHERE id = ?1")
+    .bind(id, disposition, new Date().toISOString())
+    .run();
+  return Response.json(
+    { ok: true, disposition },
+    { headers: { "Cache-Control": "no-store" } },
+  );
 }
 
 async function ackInvestigation(env: Env, id: string, req: Request): Promise<Response> {
@@ -551,6 +624,23 @@ export default {
       if (relayText === null)
         return new Response("payload too large", { status: 413 });
       const events = parseRelayBody(relayText);
+      if (events.length) {
+        // Relay heartbeat for the telemetry-blind-spot detector (run-5):
+        // one meta write per ~5 min per isolate, never per batch.
+        if (Date.now() - relayHeartbeatAt > RELAY_META_PERIOD_MS) {
+          relayHeartbeatAt = Date.now();
+          const metaEnv = env as unknown as ServiceEnv;
+          if (metaEnv.REPORTS_D1) {
+            void metaEnv.REPORTS_D1.prepare(
+              "INSERT INTO meta (key, value, updated_at) VALUES ('vector_last_sample_at', ?1, ?1) " +
+                "ON CONFLICT(key) DO UPDATE SET value = ?1, updated_at = ?1",
+            )
+              .bind(new Date().toISOString())
+              .run()
+              .catch(() => {});
+          }
+        }
+      }
       if (events.length) {
         // OTel-lite: anomalies only (volume - the relay fires every ~2 s).
         // Kinds only, never ticker text. Ships via logpush into
@@ -782,6 +872,22 @@ export default {
     const invMatch = path.match(/^\/api\/investigations\/([A-Za-z0-9-_.]{1,64})$/);
     if (invMatch && req.method === "GET") {
       return getInvestigation(env, invMatch[1], );
+    }
+
+    const triageMatch = path.match(/^\/api\/investigations\/([A-Za-z0-9-_.]{1,64})\/triage$/);
+    if (triageMatch && req.method === "POST") {
+      const og = originGuard(req);
+      if (og) return og;
+      const jg = jsonTypeGuard(req);
+      if (jg) return jg;
+      const triageText = await readBoundedBody(req, 1024);
+      if (triageText === null) return new Response("payload too large", { status: 413 });
+      const boundedReq = new Request(req.url, {
+        method: "POST",
+        headers: req.headers,
+        body: triageText,
+      });
+      return triageInvestigation(env, triageMatch[1], boundedReq);
     }
 
     const ackMatch = path.match(/^\/api\/investigations\/([A-Za-z0-9-_.]{1,64})\/ack$/);

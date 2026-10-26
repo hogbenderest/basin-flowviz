@@ -222,6 +222,9 @@ export interface InvestigationReport {
   createdAtUTC: string;
   version: number;
   supersedes?: string;
+  // Round 5 persona fields (analyst triage):
+  severity?: "critical" | "high" | "medium" | "low";
+  mitreTag?: string | null;
 }
 
 // --- ask response ---
