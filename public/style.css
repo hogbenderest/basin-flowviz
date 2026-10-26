@@ -503,3 +503,7 @@ body.scoped #edges path.edge-hover { opacity: 1; stroke: var(--orange-dim); }
 
 /* run-4: a stalled live feed says so */
 .ticker-title.stale { color: var(--danger); }
+
+/* run-5: commit-state on live lines - orange timestamp until the
+   archive row is queryable (~2 min pipeline lag), gray after */
+#ticker-list li.pending .ticker-ts { color: var(--orange); }

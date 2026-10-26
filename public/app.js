@@ -562,6 +562,10 @@
     if (!modal || !body) return;
     const lineAgeSec = evInfo.tsMs ? Math.max(0, Math.round((Date.now() - evInfo.tsMs) / 1000)) : null;
     const ageNote = lineAgeSec === null ? "" : ` (this line is ${fmtAge(lineAgeSec)} old)`;
+    if (popupRetryTimer) {
+      clearTimeout(popupRetryTimer);
+      popupRetryTimer = null;
+    }
     $("event-modal-title").textContent = `event detail: ${String(evInfo.kind || "event")}`;
     if (!evInfo.id) {
       body.innerHTML =
@@ -617,12 +621,20 @@
             retryBtn.textContent = "retry now";
             retryBtn.style.marginTop = "6px";
             retryBtn.addEventListener("click", () => {
+              if (popupRetryTimer) {
+                clearTimeout(popupRetryTimer);
+                popupRetryTimer = null;
+              }
               openEventPopup(evInfo);
             });
             body.appendChild(retryBtn);
-            setTimeout(() => {
-              if (document.body.contains(retryBtn)) openEventPopup(evInfo);
-            }, 45_000);
+            evInfo._retries = (evInfo._retries || 0) + 1;
+            if (evInfo._retries <= 5) {
+              popupRetryTimer = setTimeout(() => {
+                popupRetryTimer = null;
+                if (!modal.classList.contains("hidden")) openEventPopup(evInfo);
+              }, 30_000);
+            }
           } else {
             if (lineAgeSec !== null && lineAgeSec > 110 * 60) {
               why =
@@ -642,6 +654,20 @@
   }
 
   const TICKER_LINE_TTL_MS = 15 * 60_000;
+  // Pipeline commit lag: a row becomes queryable ~1-2 minutes after the
+  // ticker shows it (live-proven, run-5). Lines younger than this are
+  // "pending": their timestamp tints orange until the archive can
+  // answer, and clicks resolve as soon as the row is committed.
+  const COMMIT_LAG_MS = 2 * 60_000;
+  let popupRetryTimer = null;
+
+  function markTickerCommitState() {
+    const now = Date.now();
+    for (const li of Array.from(tickerList.children)) {
+      const age = now - Number(li.dataset.tsMs || 0);
+      li.classList.toggle("pending", age < COMMIT_LAG_MS);
+    }
+  }
 
   function expireTickerLines() {
     const cutoff = Date.now() - TICKER_LINE_TTL_MS;
@@ -1048,6 +1074,8 @@
   pollStats();
   setInterval(pollStats, 3000);
   pollRows();
+  markTickerCommitState();
+  setInterval(markTickerCommitState, 20_000);
   // W8 boot: restore the last input mode and tab.
   try {
     setAskMode(localStorage.getItem("flowviz-ask-mode") === "sql" ? "sql" : "ai");
