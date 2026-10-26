@@ -82,7 +82,54 @@ export interface DetectorDef {
   severity: Candidate["severity"];
   enabled: boolean; // gated detectors document themselves on the card
   gatedNote?: string;
+  // Round 6: only entity-scoped patterns are suppressible. The
+  // monitor-the-monitor and whole-app detectors are close-only.
+  suppressible: boolean;
   scan: (env: SchedulerEnv, from: string, to: string) => Promise<Candidate[]>;
+}
+
+// Pattern key extraction: the stable entity part of an incident key.
+// Entity-scoped keys look like `detector:entity:YYYY-MM-DD` - the pattern
+// is `detector:entity`. Non-suppressible detectors return null.
+export function patternKey(incidentKey: string, detectorId: string): string | null {
+  const parts = incidentKey.split(":");
+  // Expected: [detectorId, entity, date] or [detectorId, entity]
+  if (parts.length < 2) return null;
+  const entity = parts.slice(1, -1).join(":") || parts[1];
+  if (!entity || entity.match(/^\d{4}-\d{2}-\d{2}/)) return null;
+  return `${detectorId}:${entity}`;
+}
+
+// Active suppressions for a set of candidate keys (one batched D1 read
+// per detector per tick, not N+1 per candidate).
+export interface ActiveSuppression {
+  pattern_key: string;
+  count: number;
+  threshold_multiplier: number;
+}
+
+export async function fetchSuppressions(
+  env: SchedulerEnv,
+  detectorId: string,
+  candidateKeys: string[],
+): Promise<Map<string, ActiveSuppression>> {
+  const map = new Map<string, ActiveSuppression>();
+  if (!env.REPORTS_D1 || candidateKeys.length === 0) return map;
+  const patterns = candidateKeys
+    .map((k) => patternKey(k, detectorId))
+    .filter((k): k is string => k !== null);
+  if (patterns.length === 0) return map;
+  const placeholders = patterns.map((_, i) => `?${i + 2}`).join(", ");
+  const r = await env.REPORTS_D1.prepare(
+    `SELECT pattern_key, count, threshold_multiplier FROM suppressions ` +
+      `WHERE detector_id = ?1 AND pattern_key IN (${placeholders}) AND expires_at > ?${patterns.length + 2}`,
+  )
+    .bind(detectorId, ...patterns, new Date().toISOString())
+    .all<{ pattern_key: string; count: number; threshold_multiplier: number }>();
+  for (const row of (Array.isArray(r) ? r : r.results ?? [])) {
+    map.set(row.pattern_key, row);
+  }
+  return map;
 }
 
 // Era-safe extraction for dns_queries (encoding changed mid-day 2026-10-24).
@@ -214,6 +261,7 @@ export const DETECTORS: DetectorDef[] = [
     pausedMs: 2 * 3600_000,
     severity: "high",
     enabled: true,
+    suppressible: true,
     scan: async (env, from, to) => {
       // Verbatim from the shipped single-detector build (playbook 7.2).
       const out = await executeGoverned(
@@ -265,6 +313,7 @@ export const DETECTORS: DetectorDef[] = [
     pausedMs: 2 * 3600_000,
     severity: "high",
     enabled: true,
+    suppressible: true,
     scan: async (env, from, to) => {
       const rows = await overviewMemo(env, from, to);
       const date = to.slice(0, 10);
@@ -294,6 +343,7 @@ export const DETECTORS: DetectorDef[] = [
     pausedMs: 2 * 3600_000,
     severity: "high",
     enabled: true,
+    suppressible: true,
     scan: async (env, from, to) => {
       const rows = await overviewMemo(env, from, to);
       const date = to.slice(0, 10);
@@ -324,6 +374,7 @@ export const DETECTORS: DetectorDef[] = [
     pausedMs: 1 * 3600_000,
     severity: "high",
     enabled: true,
+    suppressible: false, // monitor-the-monitor: never silently suppressible
     scan: async (env) => {
       const outRows: Candidate[] = [];
       const date = new Date().toISOString().slice(0, 10);
@@ -384,6 +435,7 @@ export const DETECTORS: DetectorDef[] = [
     pausedMs: 1 * 3600_000,
     severity: "medium",
     enabled: true,
+    suppressible: false, // whole-app scope: close only
     scan: async (env, from, to) => {
       const out = await executeGoverned(
         env,
@@ -422,6 +474,7 @@ export const DETECTORS: DetectorDef[] = [
     pausedMs: 1 * 3600_000,
     severity: "medium",
     enabled: true,
+    suppressible: true,
     scan: async (env, from, to) => {
       const outRows: Candidate[] = [];
       const date = to.slice(0, 10);
@@ -483,6 +536,7 @@ export const DETECTORS: DetectorDef[] = [
     pausedMs: 1 * 3600_000,
     severity: "medium",
     enabled: false,
+    suppressible: true,
     gatedNote:
       "needs a filesystem utilization metric: add the disk/filesystem collector to Vector's host_metrics source (ingestion change, owner approval)",
     scan: async () => [],
@@ -579,9 +633,29 @@ async function runOne(env: SchedulerEnv, def: DetectorDef): Promise<void> {
     return;
   }
 
+  // Round 6: batch-fetch active suppressions for this detector's
+  // candidate keys (one D1 read, not N+1), then consult per candidate.
+  const suppressionMap = def.suppressible
+    ? await fetchSuppressions(env, def.id, candidates.map((c) => c.key))
+    : new Map<string, ActiveSuppression>();
+
   for (const cand of candidates) {
+    // Suppressed: increment the hit count, produce no report.
+    const pk = def.suppressible ? patternKey(cand.key, def.id) : null;
+    if (pk && suppressionMap.has(pk)) {
+      await env.REPORTS_D1.prepare(
+        "UPDATE suppressions SET count = count + 1 WHERE detector_id = ?1 AND pattern_key = ?2",
+      )
+        .bind(def.id, pk)
+        .run()
+        .catch(() => {});
+      continue;
+    }
+
+    // Coalescence: only into active (open/read) reports - a triaged
+    // (closed) report must never swallow a future detection.
     const recent = await env.REPORTS_D1.prepare(
-      "SELECT id, updated_at FROM reports WHERE incident_key = ?1 ORDER BY updated_at DESC LIMIT 1",
+      "SELECT id, updated_at FROM reports WHERE incident_key = ?1 AND status IN ('open','read') ORDER BY updated_at DESC LIMIT 1",
     )
       .bind(cand.key)
       .first<{ id: string; updated_at: string }>();

@@ -475,12 +475,28 @@ window.FlowvizAsk = (() => {
   // investigation inbox
   // ------------------------------------------------------------------
 
+  let inboxShowAll = false;
+
   async function refreshInbox() {
     const list = $("inbox-list");
     list.innerHTML = "";
-    const d = await jfetch("/api/investigations");
+    const d = await jfetch(`/api/investigations${inboxShowAll ? "?all=1" : ""}`);
     const reports = d.reports || [];
     const coverage = d.coverage || null;
+
+    // Toggle for the audit history.
+    const toggleRow = document.createElement("div");
+    toggleRow.style.display = "flex";
+    toggleRow.style.justifyContent = "flex-end";
+    const toggleBtn = document.createElement("button");
+    toggleBtn.className = "btn small";
+    toggleBtn.textContent = inboxShowAll ? "show open only" : "show all history";
+    toggleBtn.addEventListener("click", async () => {
+      inboxShowAll = !inboxShowAll;
+      await refreshInbox();
+    });
+    toggleRow.appendChild(toggleBtn);
+    list.appendChild(toggleRow);
     if (!reports.length) {
       const e = document.createElement("div");
       e.className = "ask-note";
@@ -515,7 +531,14 @@ window.FlowvizAsk = (() => {
       if (mitre) row.append(mitre);
       row.append(meta);
       row.addEventListener("click", () => openReport(r.id));
+      if (r.status === "read") row.style.opacity = "0.55";
       list.appendChild(row);
+    }
+    if (!reports.length) {
+      const e = document.createElement("div");
+      e.className = "ask-note";
+      e.textContent = inboxShowAll ? "No reports at all." : "No open reports. Use 'show all history' for the audit trail.";
+      list.appendChild(e);
     }
     renderCoverageCard(d.coverage, list);
   }
@@ -622,6 +645,7 @@ window.FlowvizAsk = (() => {
     const ack = document.createElement("button");
     ack.className = "btn small";
     ack.textContent = "mark read";
+    ack.title = "marks the report read (dims it, still in the open list); use a disposition button to close it";
     ack.addEventListener("click", async () => {
       await post(`/api/investigations/${id}/ack`, {});
       await refreshInbox();
@@ -644,10 +668,22 @@ window.FlowvizAsk = (() => {
       const b = document.createElement("button");
       b.className = "btn small";
       b.textContent = d;
+      b.title =
+        d === "false-positive"
+          ? "closes this report, suppresses the pattern (7d, 30d on repeat) and raises its threshold"
+          : d === "true-positive"
+            ? "closes this report as important and clears any suppression for the pattern"
+            : "closes this one instance; the pattern stays active";
       b.addEventListener("click", async () => {
-        await post(`/api/investigations/${id}/triage`, { disposition: d });
+        const r = await post(`/api/investigations/${id}/triage`, { disposition: d });
+        if (d === "false-positive" && r.suppressionCreated) {
+          note(`suppression created for this pattern${r.status === "closed" ? "; the report is closed" : ""}`);
+        }
         await refreshInbox();
-        await openReport(id);
+        // The report is closed; go back to the list (it will have left
+        // the open list).
+        holder.classList.add("hidden");
+        $("inbox-list").classList.remove("hidden");
       });
       triageRow.appendChild(b);
     }
@@ -703,6 +739,37 @@ window.FlowvizAsk = (() => {
       bl.appendChild(li);
     }
     card.appendChild(bl);
+    const sups = coverage.suppressions || [];
+    if (sups.length) {
+      const sh = document.createElement("div");
+      sh.className = "tl-src";
+      sh.style.marginTop = "8px";
+      sh.textContent = `active suppressions (${sups.length})`;
+      card.appendChild(sh);
+      for (const s of sups) {
+        const row = document.createElement("div");
+        row.className = "tl-row";
+        row.style.alignItems = "center";
+        const pat = document.createElement("span");
+        pat.textContent = s.pattern_key;
+        pat.style.flex = "0 0 220px";
+        pat.style.fontSize = "11px";
+        pat.style.fontFamily = "ui-monospace, Menlo, monospace";
+        const meta = document.createElement("span");
+        meta.className = "tl-what";
+        meta.textContent = `x${s.count}, threshold x${s.threshold_multiplier}, expires ${s.expires_at.slice(0, 10)}`;
+        const rm = document.createElement("button");
+        rm.className = "btn small";
+        rm.textContent = "remove";
+        rm.title = "unsuppress this pattern immediately";
+        rm.addEventListener("click", async () => {
+          await post(`/api/investigations/suppressions/${s.id}/remove`, {});
+          await refreshInbox();
+        });
+        row.append(pat, meta, rm);
+        card.appendChild(row);
+      }
+    }
     const driftBad = (coverage.drift || []).filter((x) => !x.ok);
     if (driftBad.length) {
       const dh = document.createElement("div");

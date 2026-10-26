@@ -35,7 +35,7 @@ import {
 } from "./sql";
 import type { SqlEnv } from "./sql";
 import { handleAsk, handleCatalog, handleEvidenceRows, userOf } from "./ask/handlers";
-import { runDetectors, runDriftCheck, DETECTORS, BLIND_SPOTS, type SchedulerEnv } from "./investigate/detectors";
+import { runDetectors, runDriftCheck, DETECTORS, BLIND_SPOTS, patternKey, detectorDef, type SchedulerEnv } from "./investigate/detectors";
 import { checkBudget, recordScan, executeGoverned } from "./query/service";
 import { getHeaderStats, runHeaderCollectors } from "./stats/collectors";
 import type { ServiceEnv } from "./bindings";
@@ -328,16 +328,20 @@ async function rowsHandler(env: Env): Promise<Response> {
 // Investigation inbox routes
 // ---------------------------------------------------------------------------
 
-async function listInvestigations(env: Env): Promise<Response> {
+async function listInvestigations(env: Env, url: URL): Promise<Response> {
+  const url_all = url.searchParams.get("all") === "1";
   if (!env.REPORTS_D1) {
     return Response.json(
       { reports: [], note: "report store not configured" },
       { headers: { "Cache-Control": "no-store" } },
     );
   }
+  const showAll = url_all;
   const { results } = await env.REPORTS_D1.prepare(
     "SELECT id, incident_key, playbook, status, classification, confidence, severity, mitre_tag, disposition, latest_version, created_at, updated_at " +
-      "FROM reports ORDER BY updated_at DESC LIMIT 50",
+      "FROM reports " +
+      (showAll ? "" : "WHERE status IN ('open','read') ") +
+      "ORDER BY updated_at DESC LIMIT 50",
   ).all<{
     id: string;
     incident_key: string;
@@ -376,6 +380,31 @@ async function listInvestigations(env: Env): Promise<Response> {
   } catch {
     /* coverage is best-effort */
   }
+  let suppressionRows: {
+    id: number;
+    detector_id: string;
+    pattern_key: string;
+    expires_at: string;
+    count: number;
+    threshold_multiplier: number;
+  }[] = [];
+  try {
+    const sup = await d1.prepare(
+      "SELECT id, detector_id, pattern_key, expires_at, count, threshold_multiplier FROM suppressions WHERE expires_at > ?1 ORDER BY created_at DESC",
+    )
+      .bind(new Date().toISOString())
+      .all<{
+        id: number;
+        detector_id: string;
+        pattern_key: string;
+        expires_at: string;
+        count: number;
+        threshold_multiplier: number;
+      }>();
+    suppressionRows = (Array.isArray(sup) ? sup : sup.results ?? []) as typeof suppressionRows;
+  } catch {
+    /* suppressions is best-effort */
+  }
   const coverage = {
     detectors: detectorList.map((d) => {
       const wm = watermarkRows.find((w) => w.detector_id === d.id);
@@ -388,6 +417,7 @@ async function listInvestigations(env: Env): Promise<Response> {
     }),
     drift: driftRows,
     blindSpots: BLIND_SPOTS,
+    suppressions: suppressionRows,
   };
   return Response.json(
     { reports: results ?? [], coverage },
@@ -418,8 +448,9 @@ async function getInvestigation(env: Env, id: string): Promise<Response> {
 const DISPOSITIONS = new Set(["unactioned", "acknowledged", "true-positive", "false-positive"]);
 
 async function triageInvestigation(env: Env, id: string, req: Request): Promise<Response> {
+  const headers = { "Cache-Control": "no-store" };
   if (!/^[a-z0-9-_.]{1,64}$/i.test(id) || !env.REPORTS_D1) {
-    return Response.json({ error: "not found" }, { status: 404 });
+    return Response.json({ error: "not found" }, { status: 404, headers });
   }
   let body: { disposition?: unknown } = {};
   try {
@@ -431,15 +462,72 @@ async function triageInvestigation(env: Env, id: string, req: Request): Promise<
   if (!DISPOSITIONS.has(disposition)) {
     return Response.json(
       { error: "expected disposition: unactioned|acknowledged|true-positive|false-positive" },
-      { status: 400 },
+      { status: 400, headers },
     );
   }
-  await env.REPORTS_D1.prepare("UPDATE reports SET disposition = ?2, updated_at = ?3 WHERE id = ?1")
-    .bind(id, disposition, new Date().toISOString())
+  const row = await env.REPORTS_D1.prepare(
+    "SELECT incident_key, playbook, status FROM reports WHERE id = ?1",
+  )
+    .bind(id)
+    .first<{ incident_key: string; playbook: string; status: string }>();
+  if (!row) return Response.json({ error: "not found" }, { status: 404, headers });
+
+  // Existence check + no-op guard: a stale tab must not "re-triage" a
+  // closed report (run-6 P3).
+  if (row.status === "closed" && disposition !== "unactioned") {
+    return Response.json({ ok: true, disposition: "already closed" }, { headers });
+  }
+
+  // Set the disposition; every disposition closes the report (leaves
+  // the default open list). `unactioned` reopens it.
+  const newStatus = disposition === "unactioned" ? "open" : "closed";
+  await env.REPORTS_D1.prepare(
+    "UPDATE reports SET disposition = ?2, status = ?3, updated_at = ?4 WHERE id = ?1",
+  )
+    .bind(id, disposition, newStatus, new Date().toISOString())
     .run();
+
+  // The feedback loop (round 6): false-positive creates/refreshes a
+  // suppression for the entity pattern (close-only for non-suppressible
+  // detectors); true-positive clears any existing suppression.
+  const def = detectorDef(row.playbook);
+  let suppressionCreated = false;
+  let suppressionCleared = false;
+  if (def && def.suppressible) {
+    const pk = patternKey(row.incident_key, def.id);
+    if (pk) {
+      if (disposition === "false-positive") {
+        // Atomic upsert: increments count, refreshes TTL; a repeat
+        // (count > 1 after increment) extends to 30 days (capped).
+        const existing = await env.REPORTS_D1.prepare(
+          "SELECT count FROM suppressions WHERE detector_id = ?1 AND pattern_key = ?2",
+        )
+          .bind(def.id, pk)
+          .first<{ count: number }>();
+        const ttlDays = (existing?.count ?? 0) >= 1 ? 30 : 7;
+        const expires = new Date(Date.now() + ttlDays * 24 * 3600_000).toISOString();
+        await env.REPORTS_D1.prepare(
+          "INSERT INTO suppressions (detector_id, pattern_key, created_at, expires_at, triggered_by_report, count, threshold_multiplier) " +
+            "VALUES (?1, ?2, ?3, ?4, ?5, 1, 2) " +
+            "ON CONFLICT(detector_id, pattern_key) DO UPDATE SET count = count + 1, expires_at = excluded.expires_at",
+        )
+          .bind(def.id, pk, new Date().toISOString(), expires, id)
+          .run();
+        suppressionCreated = true;
+      } else if (disposition === "true-positive") {
+        await env.REPORTS_D1.prepare(
+          "DELETE FROM suppressions WHERE detector_id = ?1 AND pattern_key = ?2",
+        )
+          .bind(def.id, pk)
+          .run();
+        suppressionCleared = true;
+      }
+    }
+  }
+
   return Response.json(
-    { ok: true, disposition },
-    { headers: { "Cache-Control": "no-store" } },
+    { ok: true, disposition, status: newStatus, suppressionCreated, suppressionCleared },
+    { headers },
   );
 }
 
@@ -866,7 +954,26 @@ export default {
     // ---- Investigation inbox (plan section 7) ----
 
     if (path === "/api/investigations" && req.method === "GET") {
-      return listInvestigations(env);
+      return listInvestigations(env, url);
+    }
+
+    // Round 6: idempotent suppression removal (the owner must always be
+    // able to undo a false suppression - a wrong suppression is worse
+    // than noise).
+    const supMatch = path.match(/^\/api\/investigations\/suppressions\/(\d+)\/remove$/);
+    if (supMatch && req.method === "POST") {
+      const og = originGuard(req);
+      if (og) return og;
+      if (!env.REPORTS_D1) return Response.json({ error: "not found" }, { status: 404 });
+      await env.REPORTS_D1.prepare(
+        "DELETE FROM suppressions WHERE id = ?1",
+      )
+        .bind(Number(supMatch[1]))
+        .run();
+      return Response.json(
+        { ok: true },
+        { headers: { "Cache-Control": "no-store" } },
+      );
     }
 
     const invMatch = path.match(/^\/api\/investigations\/([A-Za-z0-9-_.]{1,64})$/);
