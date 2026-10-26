@@ -151,6 +151,11 @@ Three secrets cannot be minted from this machine with current credentials:
    account-wide by design (bucket scoping exists only for Object-level
    permissions). Compensating controls: .dev.vars mode 600, Worker secret
    store only, never logged, revocable in one click.
+   Token inventory note (2026-10-26): a SECOND dedicated Admin R&W token now
+   exists, held only by the Cloudflare OS basin gatekeepers (cf-os-gk-basin and
+   cf-os-test-gk-basin Worker secrets) so CF OS agents can query the warehouse.
+   It is separate from the flowviz .dev.vars token - rotate them independently
+   (each is revocable alone; rotation of one does not affect the other).
 2. **Basin/Workers Pipelines Send token** - My Profile > API Tokens >
    Create Custom Token with the Pipelines Send permission. Add as
    `BASIN_INGEST_TOKEN=<value>`.
