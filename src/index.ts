@@ -472,6 +472,10 @@ async function handleEventLookup(
   if (!/^[a-z0-9_]{1,40}$/.test(kind))
     return Response.json({ error: "invalid kind" }, { status: 400, headers });
   const table = EVENT_KIND_TABLE[kind] ?? "ha.ha_state_changes";
+  const t0 = Date.now();
+  // OTel-lite: one flat line per lookup; lands in cfwork.workers_trace_events
+  // via logpush. Flat kv (not JSON) so regexp extraction is trivial. Ids
+  // and kinds only - never row contents or ticker text.
   try {
     const out = await executeGoverned(
       env as unknown as ServiceEnv,
@@ -483,16 +487,19 @@ async function handleEventLookup(
     if (!out.ok)
       return Response.json({ found: false, note: out.error }, { status: 200, headers });
     const row = out.result.rows[0];
+    console.log(
+      `evt=event.lookup id=${id} kind=${kind} table=${table} found=${row ? 1 : 0} ms=${Date.now() - t0}`,
+    );
     if (!row)
       return Response.json(
-        {
-          found: false,
-          note: "no archive row: the event predates the drill-through plumbing, the kind maps elsewhere, or the row aged out of the 2 hour lookup window",
-        },
+        { found: false, note: "no archive row in the 2 hour lookup window" },
         { status: 200, headers },
       );
     return Response.json({ found: true, table, row }, { status: 200, headers });
   } catch {
+    console.log(
+      `evt=event.lookup id=${id} kind=${kind} table=${table} found=error ms=${Date.now() - t0}`,
+    );
     return Response.json(
       { found: false, note: "lookup failed; try again" },
       { status: 200, headers },
@@ -545,6 +552,20 @@ export default {
         return new Response("payload too large", { status: 413 });
       const events = parseRelayBody(relayText);
       if (events.length) {
+        // OTel-lite: anomalies only (volume - the relay fires every ~2 s).
+        // Kinds only, never ticker text. Ships via logpush into
+        // cfwork.workers_trace_events, queryable by the app itself.
+        const noId = events.filter((e) => !e?.event_id).length;
+        if (noId) {
+          const kinds = [
+            ...new Set(
+              events
+                .filter((e) => !e?.event_id)
+                .map((e) => String(e?.event_type ?? e?.kind ?? "?").slice(0, 40)),
+            ),
+          ].join(",");
+          console.log(`evt=relay.anomaly missing_ids=${noId} kinds=${kinds}`);
+        }
         const sample = events.slice(0, 20).map(toTickerEvent);
         await hub(env).push(sample, "lan");
       }

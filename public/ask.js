@@ -623,13 +623,6 @@ window.FlowvizAsk = (() => {
     $("ask-input").addEventListener("keydown", (e) => {
       if (e.key === "Enter") ask($("ask-input").value.trim());
     });
-    $("ask-clear-scope")?.addEventListener("click", () => {
-      session.tableScope = null;
-      session.fromUTC = null;
-      session.toUTC = null;
-      if (window.__flowvizHighlight) window.__flowvizHighlight(null);
-      renderSession();
-    });
     // W8: the Investigations tab loads its inbox on activation.
     document.addEventListener("flowviz:tab", (ev) => {
       if (ev.detail && ev.detail.name === "investigations") refreshInbox();

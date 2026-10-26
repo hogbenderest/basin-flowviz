@@ -413,6 +413,22 @@
       prevTs = now;
       $("stat-rate").textContent = emaRate < 1 && emaRate > 0 ? emaRate.toFixed(1) : String(Math.round(emaRate));
 
+      // Feed staleness: if the ticker has not received anything for five
+      // minutes, say so in its title instead of leaving old lines that
+      // look live (a stalled feed was the drill-through failure class).
+      const tickLast = Number(ticker.lastTs || 0);
+      const feedTitle = document.querySelector("#ticker .ticker-title");
+      if (feedTitle) {
+        const feedAge = tickLast ? Math.round((Date.now() - tickLast) / 1000) : null;
+        if (feedAge !== null && feedAge > 300) {
+          feedTitle.textContent = `live events - stalled, last event ${fmtAge(feedAge)} ago`;
+          feedTitle.classList.add("stale");
+        } else {
+          feedTitle.textContent = "live events";
+          feedTitle.classList.remove("stale");
+        }
+      }
+
       // Bluesky particle rate follows the live firehose; LAN follows relay volume.
       rates.blue = bsky.enabled ? Math.max(2.5, Math.min(emaRate, 40)) : 0.25;
       rates.green = Math.max(0.7, Math.min(emaRate * 0.6, 30));
@@ -544,15 +560,17 @@
     const modal = $("event-modal");
     const body = $("event-modal-body");
     if (!modal || !body) return;
+    const lineAgeSec = evInfo.tsMs ? Math.max(0, Math.round((Date.now() - evInfo.tsMs) / 1000)) : null;
+    const ageNote = lineAgeSec === null ? "" : ` (this line is ${fmtAge(lineAgeSec)} old)`;
     $("event-modal-title").textContent = `event detail: ${String(evInfo.kind || "event")}`;
     if (!evInfo.id) {
       body.innerHTML =
-        `<div class="event-note">This ticker line has no event id yet: LAN events gain click-through once the Vector relay update ships. ` +
+        `<div class="event-note">This ticker line has no event id: its event predates the drill-through plumbing. ` +
         `What the ticker holds: <b>${escapeHtml(evInfo.text || "")}</b></div>`;
       modal.classList.remove("hidden");
       return;
     }
-    body.innerHTML = `<div class="event-note">looking up the archive row...</div>`;
+    body.innerHTML = `<div class="event-note">looking up the archive row${ageNote}...</div>`;
     modal.classList.remove("hidden");
     fetch(
       `/api/event/${encodeURIComponent(evInfo.id)}?kind=${encodeURIComponent(String(evInfo.kind || ""))}`,
@@ -580,8 +598,15 @@
           raw.textContent = JSON.stringify(d.row, null, 2);
           body.append(tbl, note, raw);
         } else {
+          let why = (d && d.note) || "archive row not found";
+          if (lineAgeSec !== null && lineAgeSec > 110 * 60) {
+            why =
+              "this line is outside the 2-hour lookup window (" +
+              fmtAge(lineAgeSec) +
+              " old). If the live events feed has stalled, refresh the page: stalled feeds leave old lines on screen.";
+          }
           body.innerHTML =
-            `<div class="event-note">${escapeHtml((d && d.note) || "archive row not found")}. ` +
+            `<div class="event-note">${escapeHtml(why)}. ` +
             `What the ticker holds: <b>${escapeHtml(evInfo.text || "")}</b></div>`;
         }
       })
@@ -590,25 +615,43 @@
       });
   }
 
+  const TICKER_LINE_TTL_MS = 15 * 60_000;
+
+  function expireTickerLines() {
+    const cutoff = Date.now() - TICKER_LINE_TTL_MS;
+    for (const li of Array.from(tickerList.children)) {
+      if (Number(li.dataset.tsMs || 0) < cutoff) li.remove();
+    }
+  }
+
   function addTicker(ev) {
     const kind = String(ev.kind || "event");
+    const text = String(ev.text || "");
     const evTsMs = Date.parse(ev.ts || "") || Date.now();
-    // W10: batch ingest prints identical lines (dozens of same-kind rows
-    // in one second) and the feed looks frozen. Collapse consecutive
-    // same-kind events within a 60 s window into one line with a count;
-    // the line keeps the newest timestamp and the LATEST event_id, which
-    // the W4 popup drills through.
+    // Lines expire after 15 minutes: a stalled feed empties visibly
+    // instead of leaving old-but-clickable lines (run-4 lesson).
+    expireTickerLines();
+    // W10 (fixed): collapse consecutive same-kind AND same-text events
+    // within a 60 s window. Keying on kind alone merged distinct HA
+    // sensors into one line whose visible text then disagreed with its
+    // hidden lookup id; the visible text now updates with every merge.
     const first = tickerList.firstElementChild;
     if (
       first &&
       first.dataset.kind === kind &&
+      first.dataset.text === text &&
       evTsMs - Number(first.dataset.tsMs || 0) <= 60_000
     ) {
       const n = (Number(first.dataset.count || 1) || 1) + 1;
       first.dataset.count = String(n);
       first.dataset.tsMs = String(evTsMs);
-      first.dataset.text = String(ev.text || first.dataset.text || "");
+      first.dataset.text = text;
       if (ev.event_id) first.dataset.eventId = String(ev.event_id);
+      const txtSpan = first.querySelector(".ticker-text");
+      if (txtSpan) {
+        txtSpan.textContent = text;
+        txtSpan.title = text;
+      }
       const countEl = first.querySelector(".ticker-count");
       if (countEl) countEl.textContent = "x" + n;
       const tsEl = first.querySelector(".ticker-ts");
@@ -639,6 +682,7 @@
         id: li.dataset.eventId || "",
         kind,
         text: li.dataset.text || "",
+        tsMs: Number(li.dataset.tsMs || 0),
       });
     });
     tickerList.prepend(li);
@@ -765,6 +809,9 @@
     if (name === "flow") scheduleLayout();
   }
   window.__flowvizSwitchTab = switchTab;
+  // The wire that shipped missing once (run-4 bug 1) - asserted by
+  // scripts/test-wiring.py now.
+  for (const btn of tabBtns) btn.addEventListener("click", () => switchTab(btn.dataset.tab));
 
   // ---- Ask tab input mode (AI | SQL) ----
 

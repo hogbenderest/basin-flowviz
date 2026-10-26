@@ -500,3 +500,6 @@ body.scoped #edges path.edge-hover { opacity: 1; stroke: var(--orange-dim); }
 #sql-result { min-height: 160px; }
 
 .hidden { display: none; }
+
+/* run-4: a stalled live feed says so */
+.ticker-title.stale { color: var(--danger); }

@@ -258,6 +258,10 @@ export async function probeIngestFreshness(env: ServiceEnv): Promise<void> {
   };
   await setMeta(env, "freshness", snap);
   await setMeta(env, "gate_freshness", { at: Date.now() });
+  // OTel-lite: one digest line per pass so silence never means unknown.
+  console.log(
+    `evt=freshness.pass tables=${Object.keys(perTable).length} failed=${failures.length} wifi_age=${wifiPollerAgeSec ?? -1}`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +428,10 @@ export async function collectTableStats(env: ServiceEnv): Promise<CompressionSna
     perTable,
   };
   await setMeta(env, "compression", snap);
+  // OTel-lite: one digest line per pass.
+  console.log(
+    `evt=compression.pass tables=${Object.keys(perTable).length} pct_raw=${Math.round(warehousePercentRaw ?? -1)}`,
+  );
   // Keep 14 days of per-check history; the aggregates live in meta.
   const cutoff = new Date(now - 14 * 24 * 3600_000).toISOString();
   await env.REPORTS_D1.prepare("DELETE FROM table_stats WHERE checked_at < ?1")

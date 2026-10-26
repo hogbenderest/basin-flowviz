@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generatedAt": "2026-10-25T09:45:00Z",
+  "generatedAt": "2026-10-26T01:20:00Z",
   "timezone": "Australia/Perth",
   "facts": [
     "JSON-typed columns store double-encoded JSON: the cell is a JSON string containing the JSON. Unwrap with a single-argument json_get_str(fields), then look up keys with json_get_str(json_get_str(fields), '<key>').",
@@ -674,7 +674,7 @@
         {
           "name": "Logs",
           "type": "json",
-          "note": "TEXT array of console lines; untrusted content"
+          "note": "array of {Level, Message, TimestampMs} structs: extract text with array_to_string(Logs, ' ') then ILIKE guards + regexp_replace"
         },
         {
           "name": "Exceptions",
