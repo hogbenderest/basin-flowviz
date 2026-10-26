@@ -9,6 +9,44 @@ Workers Pipelines + Workers Scripts edit permissions). Deployed URL:
 own path-scoped application - see Access note below).
 The workers.dev URL is dead (`workers_dev: false`).
 
+## Table maintenance (MANDATORY - run-5 lesson 2026-10-26)
+
+Enabling Basin Catalog is not enough: automatic maintenance (compaction
+with manifest rewriting + snapshot expiration) needs a stored credential.
+Without it the schedule exists but zero runs ever execute, every 60 s
+ingest roll adds manifest files, and within days multi-table queries die
+with error 40020 (5000 Iceberg manifests per query). Live numbers: 9,582
+manifests across the warehouse on day 2, 15,186 on day 3; after the
+credential was stored and compaction ran, the failing coverage UNION
+went from 40020 to 320 rows / 226 files.
+
+Once, after the catalog exists and tokens are minted:
+
+```
+TOKEN=<the R2 Admin R&W token from .dev.vars>
+ACC=<account id>
+# store the maintenance credential (this is what "credential_status: absent" was missing)
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d "{\"token\": \"$TOKEN\"}" \
+  "https://api.cloudflare.com/client/v4/accounts/$ACC/basin-catalog/basin-demo/credential"
+# enable compaction (128 MB target) and snapshot expiration (7 d, keep 20)
+npx wrangler basin catalog compaction enable basin-demo --target-size 128 --token "$TOKEN"
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"snapshot_expiration": {"state": "enabled", "min_snapshots_to_keep": 20, "max_snapshot_age": "7d"}}' \
+  "https://api.cloudflare.com/client/v4/accounts/$ACC/basin-catalog/basin-demo/maintenance-configs"
+```
+
+Verify: `GET /accounts/$ACC/basin-catalog/basin-demo/maintenance-configs`
+must show `credential_status: present`, then check a table's
+`maintenance-runs` for successful runs. Dashboard: Basin Catalog ->
+table -> Maintenance tab.
+
+Also note the query-side companion: `error 40020` means one query touches
+more than 5000 Iceberg manifests - batch multi-table queries small (the
+freshness probe halves batches adaptively) and remember that fresh rows
+only become queryable 1-2 minutes after the ticker shows them (pipeline
+commit lag; the drill-through popup retries).
+
 ## Status (2026-10-24)
 
 Done and verified live:

@@ -599,15 +599,41 @@
           body.append(tbl, note, raw);
         } else {
           let why = (d && d.note) || "archive row not found";
-          if (lineAgeSec !== null && lineAgeSec > 110 * 60) {
+          if (lineAgeSec !== null && lineAgeSec < 10 * 60) {
+            // Root cause (run-5, live-proven 2026-10-26): the ticker is
+            // real-time but the warehouse row only becomes queryable after
+            // the pipeline commits it (1-2 min steady state, longer while
+            // table metadata is bloated). A fresh line that returns
+            // not-found is racing the commit, not missing.
             why =
-              "this line is outside the 2-hour lookup window (" +
+              "this event was ingested " +
               fmtAge(lineAgeSec) +
-              " old). If the live events feed has stalled, refresh the page: stalled feeds leave old lines on screen.";
+              " ago and the archive row is still committing to the warehouse (pipeline lag is typically 1-2 minutes). Retrying...";
+            body.innerHTML =
+              `<div class="event-note">${escapeHtml(why)} ` +
+              `What the ticker holds: <b>${escapeHtml(evInfo.text || "")}</b></div>`;
+            const retryBtn = document.createElement("button");
+            retryBtn.className = "btn small";
+            retryBtn.textContent = "retry now";
+            retryBtn.style.marginTop = "6px";
+            retryBtn.addEventListener("click", () => {
+              openEventPopup(evInfo);
+            });
+            body.appendChild(retryBtn);
+            setTimeout(() => {
+              if (document.body.contains(retryBtn)) openEventPopup(evInfo);
+            }, 45_000);
+          } else {
+            if (lineAgeSec !== null && lineAgeSec > 110 * 60) {
+              why =
+                "this line is outside the 2-hour lookup window (" +
+                fmtAge(lineAgeSec) +
+                " old). If the live events feed has stalled, refresh the page: stalled feeds leave old lines on screen.";
+            }
+            body.innerHTML =
+              `<div class="event-note">${escapeHtml(why)}. ` +
+              `What the ticker holds: <b>${escapeHtml(evInfo.text || "")}</b></div>`;
           }
-          body.innerHTML =
-            `<div class="event-note">${escapeHtml(why)}. ` +
-            `What the ticker holds: <b>${escapeHtml(evInfo.text || "")}</b></div>`;
         }
       })
       .catch(() => {
