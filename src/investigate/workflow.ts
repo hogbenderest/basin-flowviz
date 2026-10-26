@@ -88,7 +88,12 @@ export class InvestigationWorkflow extends WorkflowEntrypoint<
     const raw = event.payload as unknown as Record<string, unknown>;
     const detectorId = String(raw.detectorId ?? "dns-volume");
     const cand = (raw.candidate ?? {}) as Record<string, unknown>;
-    if (detectorId !== "dns-volume" || raw.clientHash === undefined) {
+    // dns-volume dispatch: both legacy-shape (top-level fields) and
+    // new-shape (fields inside candidate) instances go through the
+    // full dns-volume playbook with its proper evidence steps.
+    const hasClientHash =
+      raw.clientHash !== undefined || cand.clientHash !== undefined;
+    if (detectorId !== "dns-volume" || !hasClientHash) {
       return this.genericPlaybook(
         env,
         raw as unknown as InvestigationParams,
@@ -424,15 +429,26 @@ function genericEvidenceSteps(p: InvestigationParams, def: NonNullable<ReturnTyp
   }
 }
 
-// Meta-driven detectors (telemetry-blind-spot) never query Basin: the
-// candidate aggregate itself is snapshotted as evidence.
+// Meta-driven detectors (and the dns-volume candidate snapshot) render
+// their evidence as named columns from the candidate record, not an
+// opaque single-field blob.
 async function candidateEvidence(env: SchedulerEnv, p: InvestigationParams): Promise<StepRows> {
-  const rows = [p.candidate as unknown as JsonRow];
+  const c = p.candidate ?? {};
+  const colNames = Object.keys(c).filter((k) => c[k] !== undefined);
+  const row: Record<string, Json> = {};
+  for (const k of colNames) {
+    const v = c[k];
+    row[k] =
+      typeof v === "string" || typeof v === "number" || typeof v === "boolean" || v === null
+        ? (v as Json)
+        : JSON.stringify(v);
+  }
+  const rows = [row];
   const rec = await snapshotEvidence(env, {
-    sql: "-- meta-driven detector: no warehouse query; the candidate aggregate is the evidence",
+    sql: `-- detector candidate snapshot: ${p.detectorId}`,
     result: {
       requestId: "workflow-meta",
-      schema: [{ name: "field", type: "json" }],
+      schema: colNames.map((name) => ({ name, type: "string" })),
       rows: rows as unknown as Record<string, unknown>[],
       metrics: { bytesScanned: 0, filesScanned: 0 },
       truncation: { applied: false },
@@ -442,7 +458,7 @@ async function candidateEvidence(env: SchedulerEnv, p: InvestigationParams): Pro
   });
   return {
     rows,
-    sql: "-- meta-driven detector: no warehouse query",
+    sql: `-- detector candidate snapshot: ${p.detectorId}`,
     evidenceId: rec.id,
     rowCount: rows.length,
   };
