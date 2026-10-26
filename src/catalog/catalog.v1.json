@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generatedAt": "2026-10-26T01:20:00Z",
+  "generatedAt": "2026-10-26T09:00:00Z",
   "timezone": "Australia/Perth",
   "facts": [
     "JSON-typed columns store double-encoded JSON: the cell is a JSON string containing the JSON. Unwrap with a single-argument json_get_str(fields), then look up keys with json_get_str(json_get_str(fields), '<key>').",
@@ -1172,5 +1172,98 @@
       "verifiedAt": "2026-10-25",
       "verifiedBy": "W1 live run 2026-10-25 (ILIKE guard + regexp extraction)"
     }
-  ]
+  ],
+  "extractionPatterns": {
+    "homelab.dns_queries": {
+      "fields": {
+        "method": "era_safe_coalesce",
+        "default": "COALESCE(json_get_str(fields, '<key>'), json_get_str(json_get_str(fields), '<key>'))",
+        "reason": "fields encoding changed mid-day 2026-10-24: single-encoded after, double-encoded before. The COALESCE form covers both eras.",
+        "keys": [
+          "domain",
+          "client_hash",
+          "query_type"
+        ],
+        "cap": "payloads ~150 bytes, well under the 2000-byte JSON function cap"
+      }
+    },
+    "homelab.host_metrics": {
+      "fields": {
+        "method": "text_guard_regexp",
+        "default": "regexp_replace(fields, '^.*\"<key>\":(-?[0-9.]+).*$', '$1') for numeric values; regexp_replace(fields, '^.*\"name\":\"([a-z_0-9]+)\".*$', '$1') for the name field",
+        "guard": "fields ILIKE '%wifi_client%' (or '%wifi_ap_radio%' for AP rows)",
+        "reason": "wifi radio rows are string-wrapped (~250 B, json_get_str returns null on them); legacy server111 metric rows are double-encoded AND ~2.2 KB, exceeding the 2000-byte JSON function cap",
+        "fallback": "for legacy rows only: regexp_replace on the raw text",
+        "keys": [
+          "name",
+          "value",
+          "tags.ap",
+          "tags.channel",
+          "tags.radio",
+          "tags.noise",
+          "tags.tx_rate_kbps",
+          "tags.tx_retries"
+        ],
+        "cap": "wifi rows ~250 B (fine); legacy rows ~2200 B (exceeds cap)"
+      }
+    },
+    "homelab.syslog": {
+      "message": {
+        "method": "direct",
+        "default": "message ILIKE '%pattern%' for searching; regexp_replace(fields, ...) for structured extraction",
+        "reason": "message is a plain TEXT column, directly queryable",
+        "cap": "truncated to 2000 chars at ingest"
+      }
+    },
+    "cfwork.workers_trace_events": {
+      "Logs": {
+        "method": "array_to_string",
+        "default": "array_to_string(Logs, ' ') ILIKE '%pattern%' for searching; regexp_replace(array_to_string(Logs, ' '), ...) for structured extraction",
+        "reason": "Logs is an array of {Level, Message[], TimestampMs} structs; array_to_string flattens it for text operations",
+        "cap": "may be large; use ILIKE guards before regexp"
+      },
+      "note": "ALL column names are MixedCase (e.g. \"Outcome\", \"ScriptName\", \"ClientIP\") and MUST be double-quoted in SQL"
+    },
+    "cfzone.http_requests": {
+      "note": "ALL column names are MixedCase (e.g. \"ClientIP\", \"EdgeResponseStatus\", \"ClientRequestPath\") and MUST be double-quoted in SQL"
+    },
+    "cfzone.firewall_events": {
+      "note": "ALL column names are MixedCase and MUST be double-quoted in SQL"
+    },
+    "cfzone.dns_logs": {
+      "note": "ALL column names are MixedCase and MUST be double-quoted in SQL"
+    },
+    "homelab.unifi_clients": {
+      "fields": {
+        "method": "string_replace_count",
+        "default": "(LENGTH(fields) - LENGTH(replace(fields, '\"type\":\"WIRELESS\"', ''))) / 21.0 for counting wireless clients; the 39 KB body exceeds all JSON function caps",
+        "reason": "each row is a full JSON array of all clients (~39 KB); cannot use json_get_* at all",
+        "cap": "~39 KB per row, far exceeds the 2000-byte cap"
+      }
+    },
+    "homelab.unifi_devices": {
+      "fields": {
+        "method": "string_replace_count",
+        "default": "same approach as unifi_clients; the body is a full device array",
+        "cap": "large body"
+      }
+    },
+    "cross_references": {
+      "wifi_signal": "wifi signal strength (dBm) lives in homelab.host_metrics with fields name='wifi_client', NOT in unifi_clients (the Integration API carries no radio metrics)",
+      "wifi_channel_utilisation": "AP channel utilisation lives in homelab.host_metrics with fields name='wifi_ap_radio'",
+      "client_counts": "unifi_clients carries snapshot arrays (one row per poll, not one row per client); count with the string-replace trick or approximate from host_metrics wifi_client rows",
+      "sensor_vs_state": "ha_sensor_readings carries event_type='sensor' only; ha_state_changes carries ALL event types including sensors (do not sum both tables)",
+      "syslog_sources": "homelab.syslog conflates journald (server111), docker, openWrt and remote-syslog rows; the host column identifies the source",
+      "dns_client_identity": "dns_queries.client_hash is a salted sha256; identity labelling is local-only by design (the catalogue ships an empty clientHashIdentities map)"
+    },
+    "platform_facts": {
+      "json_function_cap": "JSON function inputs are capped at 2000 bytes. Rows with larger fields fields need regexp_replace on the raw text, not json_get_*.",
+      "manifest_cap": "A single query may reference at most 5000 Iceberg manifests (error 40020). Multi-table UNIONs must be batched. Table maintenance with valid credentials keeps manifests low.",
+      "query_minimum": "Data-bearing queries bill a minimum of 10 MB of compressed data scanned, regardless of actual scan size. Metadata-only operations (EXPLAIN, SHOW, DESCRIBE) are free.",
+      "pipeline_commit_lag": "Rows become queryable 1-2 minutes after ingest (pipeline commit lag). The ticker is real-time; the warehouse is not.",
+      "era_boundaries": "dns_queries fields changed encoding at 2026-10-24T11:30Z (double-encoded before, single after). dns_queries.client_hash changed hash scheme at 2026-10-24T08:42Z (unsalted before, salted after). host_metrics gained string-wrapped wifi radio rows at 2026-10-25T09:18Z.",
+      "mixed_case_columns": "All cfzone.* and cfwork.* column names are MixedCase and MUST be double-quoted in SQL (e.g. \"ClientIP\" not ClientIP).",
+      "time_columns": "__ingest_ts exists on every table and is the reliable time-bounding column (event timestamps can drift, especially for router-origin syslog). Basin SQL supports date_trunc('hour', col) and now() - INTERVAL 'N day/hour/minute'."
+    }
+  }
 }
