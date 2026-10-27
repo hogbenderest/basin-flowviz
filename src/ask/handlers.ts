@@ -19,6 +19,104 @@ export function userOf(req: Request): string {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Evidence column labels: the raw SQL aliases are compact (m, c, h, v, n).
+// The owner should never have to guess what a column means, so the rows
+// endpoint ships a columnLabels map alongside the data. Compact single-letter
+// aliases are only relabelled when the evidence SQL matches a known source
+// table; arbitrary planner SQL keeps its raw aliases.
+// ---------------------------------------------------------------------------
+
+const COUNT_NOUN_BY_TABLE: [RegExp, string][] = [
+  [/from\s+homelab\.dns_queries\b/i, "queries"],
+  [/from\s+homelab\.syslog\b/i, "log lines"],
+  [/from\s+homelab\.host_metrics\b/i, "samples"],
+  [/from\s+cfwork\.workers_trace_events\b/i, "invocations"],
+  [/from\s+homelab\.unifi_clients\b/i, "polls"],
+  [/from\s+homelab\.unifi_devices\b/i, "polls"],
+];
+
+function countNoun(sql: string): string {
+  for (const [re, noun] of COUNT_NOUN_BY_TABLE) if (re.test(sql)) return noun;
+  return "count";
+}
+
+// Unambiguous aliases (detector aggregates and candidate snapshots).
+const SPECIFIC_LABELS: Record<string, string> = {
+  h: "hour",
+  n: "samples",
+  fails: "failed auths",
+  oks: "accepted auths",
+  oom: "oom patterns",
+  distress: "distress lines",
+  bad: "non-ok outcomes",
+  distinct_domains: "distinct domains",
+  long_label_ratio: "long-label ratio",
+  domain: "domain",
+  client: "client hash",
+  host: "host",
+  source: "source",
+  detail: "detail",
+  scope: "scope",
+  ap: "access point",
+  escalated: "escalated",
+  clientHash: "client hash",
+  candidateCount: "candidate count",
+  baselineHourly: "baseline hourly",
+  windowMinutes: "window minutes",
+  avgSignal: "avg signal dBm",
+  avgCuTotal: "avg channel util %",
+  authFail: "failed auths",
+  authOk: "accepted auths",
+  windowFrom: "window from",
+  windowTo: "window to",
+  detectedAt: "detected at",
+};
+
+function prettifyColumn(name: string): string {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/_/g, " ")
+    .toLowerCase();
+}
+
+export function labelEvidenceColumns(
+  sql: string,
+  schema: { name: string; type: string }[],
+): Record<string, string> {
+  const labels: Record<string, string> = {};
+  const s = sql.toLowerCase();
+  const knownSource =
+    COUNT_NOUN_BY_TABLE.some(([re]) => re.test(sql)) ||
+    s.includes("detector candidate snapshot");
+  for (const col of schema) {
+    const k = col.name;
+    let label: string | undefined;
+    if (knownSource) {
+      if (k === "m") {
+        label = s.includes("date_trunc('minute'") ? "minute" : "latest ingest";
+      } else if (k === "c") {
+        label = s.includes("count(distinct") ? "distinct count" : countNoun(sql);
+      } else if (k === "v") {
+        label = s.includes("wifi_ap_radio")
+          ? "avg channel util %"
+          : s.includes("wifi_client")
+            ? "avg signal dBm"
+            : "value";
+      } else if (k === "total") {
+        label = /dns_queries/.test(s) ? "total queries" : "total";
+      }
+    }
+    if (!label) label = SPECIFIC_LABELS[k];
+    if (!label) {
+      const pretty = prettifyColumn(k);
+      if (pretty !== k) label = pretty;
+    }
+    if (label) labels[k] = label;
+  }
+  return labels;
+}
+
 function iso(x: unknown): string | null {
   if (typeof x !== "string") return null;
   const t = Date.parse(x);
@@ -339,5 +437,11 @@ export async function handleEvidenceRows(
   if (!data) {
     return Response.json({ error: "evidence not found" }, { status: 404 });
   }
-  return Response.json(data, { headers: { "Cache-Control": "no-store" } });
+  return Response.json(
+    {
+      ...data,
+      columnLabels: labelEvidenceColumns(data.sql ?? "", data.schema),
+    },
+    { headers: { "Cache-Control": "no-store" } },
+  );
 }

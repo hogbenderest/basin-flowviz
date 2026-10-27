@@ -454,8 +454,10 @@ window.FlowvizAsk = (() => {
     const t = document.createElement("table");
     const hr = document.createElement("tr");
     for (const c of d.schema || Object.keys(d.rows[0] || {})) {
+      const name = typeof c === "string" ? c : c.name;
       const th = document.createElement("th");
-      th.textContent = typeof c === "string" ? c : c.name;
+      th.textContent = (d.columnLabels && d.columnLabels[name]) || name;
+      th.title = name !== th.textContent ? `SQL column: ${name}` : "";
       hr.appendChild(th);
     }
     t.appendChild(hr);

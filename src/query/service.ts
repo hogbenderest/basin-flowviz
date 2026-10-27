@@ -300,15 +300,21 @@ export async function loadEvidenceRows(
   id: string,
   offset: number,
   limit: number,
-): Promise<{ rows: Record<string, unknown>[]; schema: { name: string; type: string }[] } | null> {
+): Promise<{
+  rows: Record<string, unknown>[];
+  schema: { name: string; type: string }[];
+  sql: string | null;
+} | null> {
   if (!evidenceIdPattern().test(id)) return null;
   const cappedOffset = Math.min(Math.max(offset ?? 0, 0), 20000);
   const cappedLimit = Math.min(Math.max(limit ?? 50, 1), 200);
   let raw: string | null = null;
+  let sql: string | null = null;
   if (env.REPORTS_D1) {
-    const r = await env.REPORTS_D1!.prepare("SELECT snapshot_key FROM evidence WHERE id = ?1")
+    const r = await env.REPORTS_D1!.prepare("SELECT snapshot_key, sql FROM evidence WHERE id = ?1")
       .bind(id)
-      .first<{ snapshot_key: string }>();
+      .first<{ snapshot_key: string; sql: string | null }>();
+    sql = r?.sql ?? null;
     if (r?.snapshot_key && env.REPORTS_R2) {
       const obj = await env.REPORTS_R2.get(r.snapshot_key);
       if (obj) raw = await obj.text();
@@ -323,6 +329,7 @@ export async function loadEvidenceRows(
     return {
       rows: parsed.rows.slice(cappedOffset, cappedOffset + cappedLimit),
       schema: parsed.schema,
+      sql,
     };
   } catch {
     return null;
