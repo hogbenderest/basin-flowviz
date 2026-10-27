@@ -406,6 +406,12 @@ body.scoped #edges path.edge-hover { opacity: 1; stroke: var(--orange-dim); }
 .report-head { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
 .report-conf { color: var(--muted); font-size: 11px; }
 .finding { display: flex; align-items: baseline; gap: 8px; padding: 2px 0; font-size: 12.5px; }
+.finding-metrics { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 0 6px 58px; }
+.metric-chip {
+  font-size: 11px; color: var(--muted);
+  background: var(--card); border: 1px solid var(--card-border); border-radius: 10px;
+  padding: 2px 8px; white-space: nowrap;
+}
 
 
 

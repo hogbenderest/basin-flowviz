@@ -487,6 +487,7 @@ function genericSynthesis(
             statement: `${N("authFail")} failed and ${N("authOk")} accepted auth lines on ${S("host")}`,
             evidenceKind: "auth-hourly-24h",
             classification: "supported",
+            metrics: { "failed auths": N("authFail"), "accepted auths": N("authOk"), host: S("host") },
           },
         ],
         uncertainty: [...gapNote, "auth lines carry host but not source address: attribution is correlation, not identity"],
@@ -508,6 +509,7 @@ function genericSynthesis(
             statement: `${N("oom")} OOM patterns, ${N("distress")} service failure/restart lines on ${S("host")}`,
             evidenceKind: "distress-hourly-24h",
             classification: "supported",
+            metrics: { "oom patterns": N("oom"), "distress lines": N("distress"), host: S("host") },
           },
         ],
         uncertainty: [...gapNote, "log lines are conflated across journald, docker and remote syslog for this host"],
@@ -527,6 +529,12 @@ function genericSynthesis(
             statement: `${N("bad")} non-ok outcomes in the detection window`,
             evidenceKind: "hourly-24h",
             classification: "supported",
+            metrics: {
+              "non-ok outcomes": N("bad"),
+              ...Object.fromEntries(
+                Object.entries((c.breakdown ?? {}) as Record<string, number>).map(([k, v]) => [`${k} outcomes`, Number(v)]),
+              ),
+            },
           },
         ],
         uncertainty: [...gapNote, "canceled outcomes are expected during deploys"],
@@ -543,6 +551,7 @@ function genericSynthesis(
             statement: S("detail") || "a monitored source stopped reporting",
             evidenceKind: "candidate",
             classification: "supported",
+            metrics: { source: S("source") },
           },
         ],
         uncertainty: ["absence of telemetry is not absence of events (plan 7.1)"],
@@ -567,6 +576,10 @@ function genericSynthesis(
                 : `${N("avgSignal")} dBm average signal on ${target}`,
             evidenceKind: "hourly-24h",
             classification: "supported",
+            metrics:
+              scope === "ap"
+                ? { "avg channel util %": N("avgCuTotal"), ap: S("ap") }
+                : { "avg signal dBm": N("avgSignal"), client: S("client") },
           },
         ],
         uncertainty: [...gapNote, "60 s sampling misses fast fades; PHY rate is not throughput"],
@@ -610,6 +623,7 @@ function assembleGenericReport(
     statement: f.statement,
     evidence: evidenceFor(f.evidenceKind),
     classification: f.classification,
+    metrics: f.metrics,
   }));
   const timeline = (ctx.collected[0]?.rows ?? []).slice(0, 30).map((r) => ({
     ts: String((r as Record<string, unknown>).h ?? (r as Record<string, unknown>).m ?? p.windowFrom),
@@ -738,7 +752,12 @@ interface SynthesisResult {
   classification: "suspicious" | "benign" | "inconclusive" | "informational";
   confidence: "low" | "medium" | "high";
   summary: string;
-  findings: { statement: string; evidenceKind: string; classification: Finding["classification"] }[];
+  findings: {
+    statement: string;
+    evidenceKind: string;
+    classification: Finding["classification"];
+    metrics?: Record<string, number | string>;
+  }[];
   uncertainty: string[];
   nextSteps: string[];
   usedModel: boolean;
@@ -778,8 +797,15 @@ async function synthesize(
   env: SchedulerEnv,
   stats: Record<string, unknown>,
 ): Promise<SynthesisResult> {
+  const withMetrics = (res: SynthesisResult): SynthesisResult => ({
+    ...res,
+    findings: res.findings.map((f) => ({
+      ...f,
+      metrics: dnsMetricsFor(f.evidenceKind, stats) ?? f.metrics,
+    })),
+  });
   const fallback = deterministicSynthesis(stats);
-  if (!env.AI) return fallback;
+  if (!env.AI) return withMetrics(fallback);
   try {
     const out = (await env.AI.run(env.ASK_MODEL ?? "@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
       messages: [
@@ -801,9 +827,9 @@ async function synthesize(
       findings?: SynthesisResult["findings"];
     };
     const ALLOWED = ["suspicious", "benign", "inconclusive", "informational"];
-    if (!parsed.classification || !ALLOWED.includes(parsed.classification)) return fallback;
-    if (!parsed.findings?.length) return fallback;
-    return {
+    if (!parsed.classification || !ALLOWED.includes(parsed.classification)) return withMetrics(fallback);
+    if (!parsed.findings?.length) return withMetrics(fallback);
+    return withMetrics({
       classification: parsed.classification as SynthesisResult["classification"],
       confidence: (["low", "medium", "high"].includes(String(parsed.confidence))
         ? parsed.confidence
@@ -822,9 +848,58 @@ async function synthesize(
       uncertainty: (parsed.uncertainty ?? []).slice(0, 4).map((u) => String(u).slice(0, 200)),
       nextSteps: (parsed.nextSteps ?? []).slice(0, 4).map((s) => String(s).slice(0, 200)),
       usedModel: true,
-    };
+    });
   } catch {
-    return fallback;
+    return withMetrics(fallback);
+  }
+}
+
+// Deterministic labelled numbers per finding, keyed by evidence kind.
+// Attached AFTER the model call so the values always come from verified
+// stats - the model can phrase the statement, never the numbers.
+function dnsMetricsFor(
+  kind: string,
+  stats: Record<string, unknown>,
+): Record<string, number | string> | undefined {
+  const shape = (stats.shape as Record<string, unknown>) ?? {};
+  const buckets = (stats.minuteBuckets as { c?: unknown }[]) ?? [];
+  const top = (stats.topDomains as { domain?: unknown; c?: unknown }[]) ?? [];
+  const perClient = (stats.perClientTop as { client?: unknown; c?: unknown }[]) ?? [];
+  const fresh = (stats.freshness as Record<string, unknown>) ?? {};
+  switch (kind) {
+    case "minute-buckets": {
+      const peak = buckets.reduce((m, b) => Math.max(m, Number(b.c ?? 0)), 0);
+      return {
+        requests: Number(stats.candidateCount ?? 0),
+        "window minutes": Number(stats.windowMinutes ?? 0),
+        "baseline hourly": Number(stats.baselineHourly ?? 0),
+        "peak per minute": peak,
+      };
+    }
+    case "shape":
+      return {
+        "distinct domains": Number(shape.distinct_domains ?? 0),
+        "long-label ratio %": Math.round(Number(shape.long_label_ratio ?? 0) * 100),
+      };
+    case "top-domains": {
+      const d = top[0] ?? {};
+      return {
+        "top domain": String(d.domain ?? ""),
+        "top domain queries": Number(d.c ?? 0),
+      };
+    }
+    case "per-client": {
+      const b = perClient[0] ?? {};
+      return {
+        "busiest client queries": Number(b.c ?? 0),
+      };
+    }
+    case "baseline":
+      return { "baseline hourly": Number(stats.baselineHourly ?? 0) };
+    case "freshness":
+      return { "table rows (24h)": Number(fresh.c ?? 0) };
+    default:
+      return undefined;
   }
 }
 
@@ -895,6 +970,7 @@ function assembleReport(
     statement: f.statement,
     evidence: evidenceFor(f.evidenceKind),
     classification: f.classification,
+    metrics: f.metrics,
   }));
   const timeline = ctx.minuteBuckets.slice(0, 30).map((r) => ({
     ts: String(r.m ?? p.windowFrom),

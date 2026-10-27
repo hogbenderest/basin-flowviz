@@ -178,6 +178,10 @@ export interface Finding {
   statement: string;
   evidence: string[]; // evidence IDs; must be non-empty
   classification: "supported" | "refuted" | "unresolved";
+  // Labelled detector numbers attached deterministically from verified
+  // stats (never model-generated). Readable keys; rendered as chips by
+  // the inbox. Absent on reports written before this field existed.
+  metrics?: Record<string, number | string>;
   uncertainty?: string;
 }
 

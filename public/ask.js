@@ -593,6 +593,17 @@ window.FlowvizAsk = (() => {
       txt.textContent = f.statement;
       row.append(st, txt);
       holder.appendChild(row);
+      if (f.metrics) {
+        const mx = document.createElement("div");
+        mx.className = "finding-metrics";
+        for (const [k, v] of Object.entries(f.metrics)) {
+          const chip = document.createElement("span");
+          chip.className = "metric-chip";
+          chip.textContent = `${k}: ${v}`;
+          mx.appendChild(chip);
+        }
+        holder.appendChild(mx);
+      }
     }
 
     const cov = document.createElement("div");
