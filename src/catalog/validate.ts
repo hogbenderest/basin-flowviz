@@ -32,9 +32,8 @@ export type PlanOutcome =
   | { ok: false; ambiguous: string[] }
   | { ok: false; unsupported: string };
 
-interface NormalizedWindow {
-  fromUTC: string;
-  toUTC: string;
+export interface NormalizedWindow extends WindowBounds {
+  defaulted: boolean;
 }
 
 // Era-safe expression for a JSON path on a fields column.
@@ -131,16 +130,103 @@ function filterSql(tableId: string, filters: PlanFilter[]): string | null {
   return parts.length ? parts.join(" AND ") : "";
 }
 
-function resolveWindow(plan: Partial<QueryPlan>, now: Date): NormalizedWindow | null {
-  const toMs = plan.toUTC ? Date.parse(plan.toUTC) : now.getTime();
-  const fromMs = plan.fromUTC ? Date.parse(plan.fromUTC) : toMs - DEFAULT_HOURS * 3600_000;
-  if (!Number.isFinite(toMs) || !Number.isFinite(fromMs)) return null;
+// Optional window fallback: the Ask session scope. Used when the plan's own
+// timestamps are missing, empty or unparseable, before the 24h default.
+export interface WindowFallback {
+  fromUTC?: string;
+  toUTC?: string;
+}
+
+// Parse a date-ish value: null for missing, empty, or unparseable strings.
+// Date.parse("now"), Date.parse("last 24 hours") and Date.parse("") all
+// return NaN, so model-emitted natural-language windows land here and fall
+// back instead of failing the whole plan.
+function parseDateMs(v: unknown): number | null {
+  if (typeof v !== "string") return null;
+  const s = v.trim();
+  if (!s) return null;
+  const ms = Date.parse(s);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+// Resolve the plan's window. Resolution order per bound: the plan's own
+// value, then the session fallback, then the default (toUTC = now,
+// fromUTC = now - DEFAULT_HOURS). Unusable model windows (unparseable
+// strings, future bounds, degenerate ranges) recover to a sane window
+// instead of failing the plan; only the 30-day cap stays fatal.
+// Bounds-only window shape: the helpers that only fill SQL placeholders
+// never care whether the window was defaulted.
+export interface WindowBounds {
+  fromUTC: string;
+  toUTC: string;
+}
+
+// Windows narrower than this are unanswerable anyway (pipeline commit lag
+// is 1-2 minutes), and near-zero windows produced by recovery are noise.
+const MIN_WINDOW_MS = 5 * 60_000;
+
+export function resolveWindow(
+  plan: Partial<QueryPlan>,
+  now: Date,
+  fallback?: WindowFallback,
+): NormalizedWindow | null {
+  const planTo = parseDateMs(plan.toUTC);
+  const planFrom = parseDateMs(plan.fromUTC);
+  const fbTo = fallback ? parseDateMs(fallback.toUTC) : null;
+  const fbFrom = fallback ? parseDateMs(fallback.fromUTC) : null;
+  let toMs = planTo ?? fbTo ?? now.getTime();
+  let fromMs = planFrom ?? fbFrom ?? toMs - DEFAULT_HOURS * 3600_000;
+  let defaulted = planTo === null || planFrom === null;
+  let reason: string | null = defaulted ? "missing_or_unparseable" : null;
+  let touched = defaulted;
+
+  // A future upper bound is a model mistake (usually a timezone slip:
+  // Perth time labelled as UTC). Clamp to now: never query the future.
+  if (toMs > now.getTime() + 5 * 60_000) {
+    toMs = now.getTime();
+    defaulted = true;
+    touched = true;
+    reason = reason ?? "future_to_clamped";
+  }
+  // A degenerate range (zero-width or inverted: live-observed shapes
+  // include from=tomorrow/to=yesterday) means BOTH bounds are suspect.
+  // Reset to the honest default: session scope, else last 24h to now.
+  if (fromMs >= toMs) {
+    toMs = fbTo ?? now.getTime();
+    fromMs = fbFrom ?? toMs - DEFAULT_HOURS * 3600_000;
+    defaulted = true;
+    touched = true;
+    reason = reason ?? "degenerate_range";
+  }
+  // A window a recovery step squeezed into a sliver (e.g. from=now with
+  // to=now+4h clamped to now) matches nothing. Widen to the default span
+  // ending at the sane upper bound. Coherent narrow windows the model
+  // emitted deliberately are left alone.
+  if (touched && toMs - fromMs < MIN_WINDOW_MS) {
+    fromMs = toMs - DEFAULT_HOURS * 3600_000;
+    defaulted = true;
+    reason = reason === "missing_or_unparseable" ? "too_narrow_after_recovery" : reason;
+  }
+  // A still-degenerate window means the fallback itself was unusable.
   if (fromMs >= toMs) return null;
+  // The one guardrail that stays fatal: valid dates more than 30 days
+  // apart are deliberate user intent and must hit the cost cap honestly.
   if (toMs - fromMs > MAX_WINDOW_DAYS * 86400_000) return null;
-  if (toMs > now.getTime() + 5 * 60_000) return null;
+  if (defaulted) {
+    // Bounded, content-free diagnosis (never the question or model prose):
+    // the offending plan values, capped, plus the window actually used.
+    console.log(
+      `evt=ask.window.defaulted reason=${reason} ` +
+        `plan_from=${JSON.stringify(typeof plan.fromUTC === "string" ? plan.fromUTC.slice(0, 40) : null)} ` +
+        `plan_to=${JSON.stringify(typeof plan.toUTC === "string" ? plan.toUTC.slice(0, 40) : null)} ` +
+        `fallback=${fallback ? "session" : "default24h"} ` +
+        `resolved=${new Date(fromMs).toISOString()}/${new Date(toMs).toISOString()}`,
+    );
+  }
   return {
     fromUTC: new Date(fromMs).toISOString(),
     toUTC: new Date(toMs).toISOString(),
+    defaulted,
   };
 }
 
@@ -178,16 +264,24 @@ function defaultChart(
 
 function fillLiteralSql(
   sql: string,
-  w: NormalizedWindow,
+  w: WindowBounds,
 ): string {
   return sql.replaceAll("{FROM}", sqlLit(w.fromUTC)).replaceAll("{TO}", sqlLit(w.toUTC));
 }
 
 // Compile a normalized plan (from the model or built from a verified question).
-export function compilePlan(plan: QueryPlan, question: string, now: Date): PlanOutcome {
+export function compilePlan(
+  plan: QueryPlan,
+  question: string,
+  now: Date,
+  fallback?: WindowFallback,
+): PlanOutcome {
   const notes: string[] = [];
-  const w = resolveWindow(plan, now);
-  if (!w) return { ok: false, error: "invalid or missing time window" };
+  const w = resolveWindow(plan, now, fallback);
+  if (!w) return { ok: false, error: "time window exceeds the 30-day cap" };
+  const defaultedNote = fallback
+    ? "Time window taken from the session scope (the plan's window was unusable: missing, unparseable, or out of range)."
+    : "Time window defaulted to the last 24 hours (the plan's window was unusable: missing, unparseable, or out of range).";
 
   // Verified-question shortcut: the catalogue carries either literal SQL or
   // compiler params; both are owner-checked and produce bounded SQL. An
@@ -198,16 +292,24 @@ export function compilePlan(plan: QueryPlan, question: string, now: Date): PlanO
       if (v.status !== "available") {
         return { ok: false, unsupported: v.notes.join(" ") || "verified question is not available" };
       }
+      // Merge the model's plan values over the windowHours-derived window,
+      // but only when the plan actually carries non-empty timestamps: an
+      // empty-string spread previously clobbered windowHours (q-dns-hourly
+      // silently shrank from 168h to 24h on the model-unavailable path).
+      const planWin: Partial<QueryPlan> = {};
+      if (plan.fromUTC) planWin.fromUTC = plan.fromUTC;
+      if (plan.toUTC) planWin.toUTC = plan.toUTC;
       const vw = resolveWindow(
         {
           ...(v.params?.windowHours
             ? { fromUTC: new Date(now.getTime() - (v.params.windowHours as number) * 3600_000).toISOString(), toUTC: now.toISOString() }
             : {}),
-          ...plan,
+          ...planWin,
         } as QueryPlan,
         now,
+        fallback,
       );
-      if (!vw) return { ok: false, error: "invalid window for verified question" };
+      if (!vw) return { ok: false, error: "verified question window exceeds the 30-day cap" };
       let sql: string;
       if (v.sql) {
         sql = fillLiteralSql(v.sql, vw);
@@ -237,7 +339,10 @@ export function compilePlan(plan: QueryPlan, question: string, now: Date): PlanO
         ok: true,
         compiled: { sql, primaryTable: v.table, baselineSql },
         chart,
-        notes: v.notes,
+        // Only surface the defaulted-window note when the VERIFIED window
+        // itself defaulted (not when the plan-level w defaulted but
+        // windowHours supplied a valid window).
+        notes: vw.defaulted ? [defaultedNote, ...v.notes] : [...v.notes],
         fromUTC: vw.fromUTC,
         toUTC: vw.toUTC,
       };
@@ -250,6 +355,7 @@ export function compilePlan(plan: QueryPlan, question: string, now: Date): PlanO
       unsupported: plan.unsupportedReason ?? "the requested analysis is not supported by the available telemetry",
     };
   }
+  if (w.defaulted) notes.push(defaultedNote);
   if (plan.archetype === "scenario") {
     // The scenario service handles execution; compilation is not needed.
     return { ok: false, error: "scenario archetype is handled by the assembly service" };
@@ -280,7 +386,7 @@ export function compilePlan(plan: QueryPlan, question: string, now: Date): PlanO
         `SELECT ${dimExpr} AS dim, ${mExpr} AS m FROM ${tableId} ` +
         `WHERE ${where} GROUP BY dim ORDER BY m DESC LIMIT ${limit}`;
       const chart = defaultChart("ranked-bars", question, w, "dim", "m");
-      return { ok: true, compiled: { sql, primaryTable: tableId }, chart, notes: table.caveats, fromUTC: w.fromUTC, toUTC: w.toUTC };
+      return { ok: true, compiled: { sql, primaryTable: tableId }, chart, notes: [...notes, ...table.caveats], fromUTC: w.fromUTC, toUTC: w.toUTC };
     }
     case "timeseries-count": {
       const grain = plan.grain === "day" ? "day" : "hour";
@@ -309,7 +415,7 @@ export function compilePlan(plan: QueryPlan, question: string, now: Date): PlanO
       }
       const chartType: ChartType = baseline ? "comparison" : "time-series";
       const chart = defaultChart(chartType, question, w, "bucket", "c", seriesExpr ? "series" : undefined, baseline);
-      return { ok: true, compiled: { sql, primaryTable: tableId, baselineSql }, chart, notes: table.caveats, fromUTC: w.fromUTC, toUTC: w.toUTC };
+      return { ok: true, compiled: { sql, primaryTable: tableId, baselineSql }, chart, notes: [...notes, ...table.caveats], fromUTC: w.fromUTC, toUTC: w.toUTC };
     }
     case "timeseries-metric": {
       if (tableId !== "ha.ha_sensor_readings") {
@@ -326,7 +432,7 @@ export function compilePlan(plan: QueryPlan, question: string, now: Date): PlanO
         `FROM ha.ha_sensor_readings WHERE ${where} ` +
         `GROUP BY date_trunc('${grain}', ts) ORDER BY bucket LIMIT 2000`;
       const chart = defaultChart("time-series", question, w, "bucket", "avg_v");
-      return { ok: true, compiled: { sql, primaryTable: tableId }, chart, notes: table.caveats, fromUTC: w.fromUTC, toUTC: w.toUTC };
+      return { ok: true, compiled: { sql, primaryTable: tableId }, chart, notes: [...notes, ...table.caveats], fromUTC: w.fromUTC, toUTC: w.toUTC };
     }
     case "latest-state": {
       if (tableId !== "ha.ha_state_changes") {
@@ -343,7 +449,7 @@ export function compilePlan(plan: QueryPlan, question: string, now: Date): PlanO
         `QUALIFY ROW_NUMBER() OVER (PARTITION BY entity_id ORDER BY ts DESC) = 1 ` +
         `ORDER BY entity_id LIMIT 200`;
       const chart = defaultChart("state-timeline", question, w, "entity_id", "state");
-      return { ok: true, compiled: { sql, primaryTable: tableId }, chart, notes: table.caveats, fromUTC: w.fromUTC, toUTC: w.toUTC };
+      return { ok: true, compiled: { sql, primaryTable: tableId }, chart, notes: [...notes, ...table.caveats], fromUTC: w.fromUTC, toUTC: w.toUTC };
     }
     case "coverage": {
       const v = getQuestion("q-coverage");
@@ -361,7 +467,7 @@ export function compilePlan(plan: QueryPlan, question: string, now: Date): PlanO
 // routing by the verified question's archetype.
 function buildFromParams(
   v: { archetype: string; table: string; params?: Record<string, unknown> },
-  w: NormalizedWindow,
+  w: WindowBounds,
   now: Date,
 ): { sql: string } | { error: string } {
   const p = (v.params ?? {}) as {

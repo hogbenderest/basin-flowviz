@@ -188,6 +188,8 @@ async function runPlan(
             toUTC: "",
             verifiedQueryId: v.id,
           };
+          // No session fallback here: a verified question's own windowHours
+          // must win (q-dns-hourly is 168h; the session would shrink it).
           const out = compilePlan(plan, question, new Date());
           if (out.ok) return { kind: "compiled", plan, compiled: out.compiled, chart: out.chart, notes: [...out.notes, "model unavailable: answered from a verified question"] };
           return { kind: "model-unavailable", error: call.error ?? "model unavailable" };
@@ -203,7 +205,10 @@ async function runPlan(
         if (plan.archetype === "scenario") {
           return { kind: "unsupported", note: "scenario requests are handled by the assembly service" };
         }
-        const out = compilePlan(plan, question, new Date());
+        // Session scope as the window fallback: when the model emits
+        // missing/unparseable timestamps, the session window is honoured
+        // before the 24h default (challenger P0).
+        const out = compilePlan(plan, question, new Date(), session);
         if (out.ok) return { kind: "compiled", plan, compiled: out.compiled, chart: out.chart, notes: out.notes };
         if ("error" in out) {
           // One bounded repair round for model-planned queries only.

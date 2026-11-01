@@ -6,10 +6,12 @@
     "dev": "wrangler dev",
     "deploy": "scripts/deploy.sh",
     "typecheck": "tsc -p tsconfig.check.json",
-    "types": "wrangler types"
+    "types": "wrangler types",
+    "test": "vitest run"
   },
   "devDependencies": {
     "typescript": "^7.0.2",
+    "vitest": "^5.0.5",
     "wrangler": "4.145.0"
   }
 }
