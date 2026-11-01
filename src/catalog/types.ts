@@ -84,6 +84,12 @@ export interface Catalogue {
   // captured at ingest; covers known static IPv4s only. IPv6 privacy clients
   // rotate and stay opaque (plan 2.3.8).
   clientHashIdentities: Record<string, string>;
+  // Server-only role identifiers (e.g. roles.routerHost: the real syslog
+  // hostname of the edge router). The committed catalogue carries neutral
+  // placeholders; real values arrive via the gitignored local overlay.
+  // Never rendered to the model or the browser (renderForModel/
+  // renderForBrowser deliberately exclude it).
+  roles?: Record<string, string>;
   facts: string[]; // live-verified platform findings the planner must respect
 }
 
@@ -229,6 +235,9 @@ export interface InvestigationReport {
   // Round 5 persona fields (analyst triage):
   severity?: "critical" | "high" | "medium" | "low";
   mitreTag?: string | null;
+  // One-line inbox list-row summary (entity + headline metric), also
+  // persisted on the D1 reports row by persistReport.
+  preview?: string;
 }
 
 // --- ask response ---

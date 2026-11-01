@@ -338,7 +338,7 @@ async function listInvestigations(env: Env, url: URL): Promise<Response> {
   }
   const showAll = url_all;
   const { results } = await env.REPORTS_D1.prepare(
-    "SELECT id, incident_key, playbook, status, classification, confidence, severity, mitre_tag, disposition, latest_version, created_at, updated_at " +
+    "SELECT id, incident_key, playbook, status, classification, confidence, severity, mitre_tag, disposition, latest_version, preview, created_at, updated_at " +
       "FROM reports " +
       (showAll ? "" : "WHERE status IN ('open','read') ") +
       "ORDER BY updated_at DESC LIMIT 50",
@@ -353,6 +353,7 @@ async function listInvestigations(env: Env, url: URL): Promise<Response> {
     mitre_tag: string | null;
     disposition: string | null;
     latest_version: number;
+    preview: string | null;
     created_at: string;
     updated_at: string;
   }>();

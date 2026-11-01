@@ -17,6 +17,7 @@ type LocalOverlay = {
   entityMaps?: Catalogue["entityMaps"];
   clientHashIdentities?: Catalogue["clientHashIdentities"];
   questions?: Record<string, Partial<VerifiedQuery>>;
+  roles?: Catalogue["roles"];
 };
 
 function mergeCatalog(base: Catalogue, local: LocalOverlay): Catalogue {
@@ -26,6 +27,7 @@ function mergeCatalog(base: Catalogue, local: LocalOverlay): Catalogue {
   }
   if (local.clientHashIdentities)
     out.clientHashIdentities = { ...local.clientHashIdentities };
+  if (local.roles) out.roles = { ...local.roles };
   if (local.questions) {
     out.questions = out.questions.map((q) =>
       local.questions![q.id] ? { ...q, ...local.questions![q.id] } : q,

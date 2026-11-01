@@ -532,6 +532,14 @@ window.FlowvizAsk = (() => {
       row.append(cls, sev);
       if (mitre) row.append(mitre);
       row.append(meta);
+      // Entity/metric preview (run 8): absent on reports written before
+      // the preview column existed.
+      if (r.preview) {
+        const pv = document.createElement("span");
+        pv.className = "inbox-preview";
+        pv.textContent = r.preview;
+        row.append(pv);
+      }
       row.addEventListener("click", () => openReport(r.id));
       if (r.status === "read") row.style.opacity = "0.55";
       list.appendChild(row);

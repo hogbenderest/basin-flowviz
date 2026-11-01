@@ -12,6 +12,7 @@ import { catalog } from "../catalog/render";
 import type { EvidenceRecord, Finding, InvestigationReport } from "../catalog/types";
 import type { SchedulerEnv } from "./detectors";
 import { detectorDef } from "./detectors";
+import { buildPreview, radioLabel } from "./preview";
 import { extractModelText } from "../ask/planner";
 import { recordAiUsage } from "../stats/collectors";
 
@@ -24,6 +25,7 @@ export interface DnsVolumeParams {
   baselineHourly: number;
   windowMinutes: number;
   detectedAt: string;
+  severity?: string;
 }
 
 // Round 5: the registry payload. New detectors (including new-shape
@@ -110,6 +112,10 @@ export class InvestigationWorkflow extends WorkflowEntrypoint<
       baselineHourly: Number(raw.baselineHourly ?? cand.baselineHourly ?? 0),
       windowMinutes: Number(raw.windowMinutes ?? cand.windowMinutes ?? 0),
       detectedAt: String(raw.detectedAt ?? new Date().toISOString()),
+      // Run-8 fix: the scheduler dispatches the candidate severity; the
+      // legacy normalizer dropped it, so dns-volume reports persisted as
+      // "medium" while the registry declares "high".
+      severity: String(raw.severity ?? "") || undefined,
     };
     return this.dnsVolume(env, p, step);
   }
@@ -375,6 +381,18 @@ function genericEvidenceSteps(p: InvestigationParams, def: NonNullable<ReturnTyp
             `FROM homelab.syslog WHERE host = ${host} AND __ingest_ts >= now() - INTERVAL '24 hours' ` +
             `GROUP BY 1 ORDER BY h LIMIT 30`,
         },
+        {
+          // Who is failing: source addresses over the same 24 hours
+          // (aggregate counts only). The length cap keeps regexp
+          // fall-through out of the result.
+          name: "top-sources",
+          sql:
+            `SELECT ip, COUNT(*) AS c FROM ( ` +
+            `SELECT regexp_replace(message, '^.*from ([0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}).*$', '$1') AS ip ` +
+            `FROM homelab.syslog WHERE host = ${host} AND __ingest_ts >= now() - INTERVAL '24 hours' ` +
+            `AND (message ILIKE '%failed password%' OR message ILIKE '%invalid user%') ` +
+            `) WHERE ip LIKE '%.%.%.%' AND length(ip) <= 15 GROUP BY ip ORDER BY c DESC LIMIT 10`,
+        },
       ];
     }
     case "host-distress": {
@@ -410,17 +428,56 @@ function genericEvidenceSteps(p: InvestigationParams, def: NonNullable<ReturnTyp
       ];
     case "wifi-degradation": {
       const scope = String(c.scope ?? "client");
+      const radio = String(c.radio ?? "");
+      const radioFilter =
+        scope === "ap" && radio
+          ? ` AND CASE WHEN fields ILIKE '%"radio":"%' THEN substr(regexp_replace(fields, '^.*"radio":"([^"]+)".*$', '$1'), 1, 40) ELSE NULL END = ${sqlLit(radio)}`
+          : "";
       const where =
         scope === "ap"
-          ? `host = ${sqlLit(String(c.ap ?? ""))} AND fields ILIKE '%wifi_ap_radio%'`
+          ? `host = ${sqlLit(String(c.ap ?? ""))} AND fields ILIKE '%wifi_ap_radio%'${radioFilter}`
           : `host = ${sqlLit(String(c.client ?? ""))} AND fields ILIKE '%wifi_client%'`;
       return [
         {
           name: "hourly-24h",
           sql:
-            `SELECT date_trunc('hour', ts) AS h, ROUND(AVG(${WIFI_SIG_SQL}), 1) AS v, COUNT(*) AS n ` +
+            `SELECT date_trunc('hour', ts) AS h, ROUND(AVG(${WIFI_SIG_SQL}), 1) AS v, ` +
+            `ROUND(AVG(CASE WHEN fields ILIKE '%"satisfaction":%' THEN TRY_CAST(regexp_replace(fields, '^.*"satisfaction":(-?[0-9.]+).*$', '$1') AS DOUBLE) END), 1) AS sat, COUNT(*) AS n ` +
             `FROM homelab.host_metrics WHERE ${where} AND __ingest_ts >= now() - INTERVAL '24 hours' ` +
             `GROUP BY 1 ORDER BY h LIMIT 30`,
+        },
+      ];
+    }
+    case "wifi-congestion": {
+      const ap = sqlLit(String(c.ap ?? ""));
+      const radio = String(c.radio ?? "");
+      const radioExpr = `CASE WHEN fields ILIKE '%"radio":"%' THEN substr(regexp_replace(fields, '^.*"radio":"([^"]+)".*$', '$1'), 1, 40) ELSE NULL END`;
+      const radioFilter = radio ? ` AND ${radioExpr} = ${sqlLit(radio)}` : "";
+      return [
+        {
+          name: "radio-hourly-24h",
+          sql:
+            `SELECT date_trunc('hour', ts) AS h, ROUND(AVG(${WIFI_SIG_SQL}), 1) AS v, ` +
+            `ROUND(AVG(TRY_CAST(regexp_replace(fields, '^.*"num_sta":(-?[0-9.]+).*$', '$1') AS DOUBLE)), 1) AS sta, ` +
+            `ROUND(AVG(TRY_CAST(regexp_replace(fields, '^.*"satisfaction":(-?[0-9.]+).*$', '$1') AS DOUBLE)), 1) AS sat, COUNT(*) AS n ` +
+            `FROM homelab.host_metrics WHERE host = ${ap} AND fields ILIKE '%wifi_ap_radio%'${radioFilter} ` +
+            `AND __ingest_ts >= now() - INTERVAL '24 hours' GROUP BY 1 ORDER BY h LIMIT 30`,
+        },
+      ];
+    }
+    case "wan-outage": {
+      const router = catalog.roles?.routerHost ?? "";
+      if (!router) return [];
+      const rh = sqlLit(router);
+      return [
+        {
+          // Heartbeat timeline: renewals per hour vs all router lines.
+          name: "renewals-hourly-48h",
+          sql:
+            `SELECT date_trunc('hour', __ingest_ts) AS h, ` +
+            `SUM(CASE WHEN message ILIKE '%udhcpc%' THEN 1 ELSE 0 END) AS v, COUNT(*) AS c ` +
+            `FROM homelab.syslog WHERE host = ${rh} AND __ingest_ts >= now() - INTERVAL '48 hours' ` +
+            `GROUP BY 1 ORDER BY h LIMIT 60`,
         },
       ];
     }
@@ -476,11 +533,14 @@ function genericSynthesis(
   switch (def.id) {
     case "ssh-brute-force": {
       const escalated = Boolean(c.escalated);
+      const topSources = (c.topSources as { ip?: string; count?: number }[] | undefined) ?? [];
+      const top = topSources[0];
+      const srcTxt = top?.ip ? ` (top source ${top.ip}, ${Number(top.count ?? 0)}x)` : "";
       return {
         classification: escalated ? "suspicious" : "inconclusive",
         confidence: escalated ? "medium" : "low",
         summary:
-          `${N("authFail")} authentication failures on ${S("host")} in the detection window` +
+          `${N("authFail")} authentication failures on ${S("host")} in the detection window${srcTxt}` +
           (escalated ? `, followed by at least one accepted login: possible successful access` : ` with no observed accepted login`),
         findings: [
           {
@@ -489,58 +549,99 @@ function genericSynthesis(
             classification: "supported",
             metrics: { "failed auths": N("authFail"), "accepted auths": N("authOk"), host: S("host") },
           },
+          ...(topSources.length
+            ? [
+                {
+                  statement: `Source addresses attempting logins: ${topSources.map((s) => `${s.ip} (${Number(s.count ?? 0)}x)`).join(", ")}`,
+                  evidenceKind: "top-sources",
+                  classification: "supported" as const,
+                  metrics: Object.fromEntries(
+                    topSources.slice(0, 3).map((s, i) => [`source ${i + 1}`, String(s.ip ?? "?")]),
+                  ),
+                },
+              ]
+            : []),
         ],
-        uncertainty: [...gapNote, "auth lines carry host but not source address: attribution is correlation, not identity"],
+        uncertainty: [
+          ...gapNote,
+          "auth lines carry host but not source address in the overview; the source table covers the last 24 hours, wider than the detection window",
+        ],
         nextSteps: escalated
-          ? ["check last logins on the host now", "review authorized_keys and recent sessions", "rotate credentials if the accepted login is unexplained"]
-          : ["watch for further failures from the same host", "verify whether the host is reachable from outside"],
+          ? [
+              "check last logins on the host now",
+              "verify the top source address is expected on this network",
+              "review authorized_keys and recent sessions",
+              "rotate credentials if the accepted login is unexplained",
+            ]
+          : ["watch for further failures from the same host", "verify whether the source address is expected on this network"],
         usedModel: false,
       };
     }
-    case "host-distress":
+    case "host-distress": {
+      const unit = S("sampleUnit");
       return {
         classification: "informational",
         confidence: "medium",
         summary:
-          `${N("oom")} memory-kill pattern matches and ${N("distress")} service-distress lines on ${S("host")}; ` +
+          `${N("oom")} memory-kill pattern matches and ${N("distress")} service-distress lines on ${S("host")}${unit ? ` (most affected unit: ${unit})` : ""}; ` +
           `this is a host health incident, not an intrusion indicator`,
         findings: [
           {
-            statement: `${N("oom")} OOM patterns, ${N("distress")} service failure/restart lines on ${S("host")}`,
+            statement: `${N("oom")} OOM patterns, ${N("distress")} service failure/restart lines on ${S("host")}${unit ? `, latest failing unit ${unit}` : ""}`,
             evidenceKind: "distress-hourly-24h",
             classification: "supported",
-            metrics: { "oom patterns": N("oom"), "distress lines": N("distress"), host: S("host") },
+            metrics: {
+              "oom patterns": N("oom"),
+              "distress lines": N("distress"),
+              ...(unit ? { "failing unit": unit } : {}),
+              host: S("host"),
+            },
           },
         ],
-        uncertainty: [...gapNote, "log lines are conflated across journald, docker and remote syslog for this host"],
+        uncertainty: [
+          ...gapNote,
+          "log lines are conflated across journald, docker and remote syslog for this host",
+          "OOM lines do not name the killed process: which workload died needs the host journal",
+        ],
         nextSteps: [
           "inspect the host's service state and memory",
+          `check whether the failing unit${unit ? ` (${unit})` : ""} restarts cleanly`,
           "check whether a deploy or restart was expected at this time",
         ],
         usedModel: false,
       };
-    case "worker-errors":
+    }
+    case "worker-errors": {
+      const scripts = (c.scripts as Record<string, number> | undefined) ?? {};
+      const topScript =
+        Object.entries(scripts).sort((a, b) => b[1] - a[1])[0]?.[0] ?? "basin-flowviz (self-monitoring)";
       return {
         classification: "informational",
         confidence: "medium",
-        summary: `${N("bad")} non-ok Worker outcomes in the window (${Object.entries((c.breakdown ?? {}) as Record<string, number>).map(([k, v]) => `${k}:${v}`).join(", ")}); the app's own invocations degraded`,
+        summary: `${N("bad")} non-ok Worker outcomes in the window (${Object.entries((c.breakdown ?? {}) as Record<string, number>).map(([k, v]) => `${k}:${v}`).join(", ")}); the app's own invocations degraded (top script: ${topScript})`,
         findings: [
           {
-            statement: `${N("bad")} non-ok outcomes in the detection window`,
+            statement: `${N("bad")} non-ok outcomes in the detection window, top script ${topScript}`,
             evidenceKind: "hourly-24h",
             classification: "supported",
             metrics: {
               "non-ok outcomes": N("bad"),
+              "top script": topScript,
               ...Object.fromEntries(
                 Object.entries((c.breakdown ?? {}) as Record<string, number>).map(([k, v]) => [`${k} outcomes`, Number(v)]),
               ),
             },
           },
         ],
-        uncertainty: [...gapNote, "canceled outcomes are expected during deploys"],
+        uncertainty: [
+          ...gapNote,
+          "canceled outcomes are expected during deploys",
+          "this detector deliberately includes the app's own script (self-monitoring: this account runs one Worker)",
+        ],
         nextSteps: ["check the Worker's recent deploys", "inspect invocation errors in the trace table"],
         usedModel: false,
       };
+    }
     case "telemetry-blind-spot":
       return {
         classification: "inconclusive",
@@ -560,33 +661,188 @@ function genericSynthesis(
       };
     case "wifi-degradation": {
       const scope = String(c.scope ?? "client");
-      const target = scope === "ap" ? S("ap") : S("client");
+      const radio = S("radio");
+      if (scope === "ap") {
+        const rl = radioLabel(radio);
+        return {
+          classification: "informational",
+          confidence: "medium",
+          summary:
+            `AP ${S("ap")} ${rl} ch${N("channel")} averaged ${N("avgCuTotal")}% channel utilisation in the window: airtime saturation`,
+          findings: [
+            {
+              statement: `${N("avgCuTotal")}% average channel utilisation on ${S("ap")} ${rl} ch${N("channel")} (${N("avgNumSta")} clients, satisfaction ${N("avgSatisfaction")}%)`,
+              evidenceKind: "hourly-24h",
+              classification: "supported",
+              metrics: {
+                "avg channel util %": N("avgCuTotal"),
+                radio: rl,
+                channel: N("channel"),
+                "avg clients": N("avgNumSta"),
+                "avg satisfaction %": N("avgSatisfaction"),
+                "avg tx retries %": N("avgTxRetriesPct"),
+                ap: S("ap"),
+              },
+            },
+          ],
+          uncertainty: [
+            ...gapNote,
+            "60 s sampling misses fast fades; PHY rate is not throughput; retries run ~20% on normal days at this site",
+          ],
+          nextSteps: [
+            `check for new interference sources on the ${rl} channel`,
+            "consider channel planning changes or splitting clients across radios",
+          ],
+          usedModel: false,
+        };
+      }
       return {
         classification: "informational",
         confidence: "medium",
         summary:
-          scope === "ap"
-            ? `AP ${target} averaged ${N("avgCuTotal")}% channel utilisation in the window: airtime saturation`
-            : `client ${target} averaged ${N("avgSignal")} dBm in the window: weak or degraded link`,
+          `client ${S("client")} averaged ${N("avgSignal")} dBm in the window (on ${S("ap") || "an unknown AP"}, ch${N("channel")}, satisfaction ${N("avgSatisfaction")}%): weak or degraded link`,
         findings: [
           {
-            statement:
-              scope === "ap"
-                ? `${N("avgCuTotal")}% average channel utilisation on ${target}`
-                : `${N("avgSignal")} dBm average signal on ${target}`,
+            statement: `${N("avgSignal")} dBm average signal on ${S("client")} (${N("samples")} samples, noise floor ${N("avgNoise")} dBm)`,
             evidenceKind: "hourly-24h",
             classification: "supported",
-            metrics:
-              scope === "ap"
-                ? { "avg channel util %": N("avgCuTotal"), ap: S("ap") }
-                : { "avg signal dBm": N("avgSignal"), client: S("client") },
+            metrics: {
+              "avg signal dBm": N("avgSignal"),
+              "avg satisfaction %": N("avgSatisfaction"),
+              "noise floor dBm": N("avgNoise"),
+              channel: N("channel"),
+              ap: S("ap"),
+              client: S("client"),
+            },
           },
         ],
         uncertainty: [...gapNote, "60 s sampling misses fast fades; PHY rate is not throughput"],
-        nextSteps:
-          scope === "ap"
-            ? ["check for new interference sources on the channel", "consider channel planning changes"]
-            : ["check the device's distance from its AP", "watch for retry growth on this client"],
+        nextSteps: [
+          "check the device's distance from its AP",
+          "watch for retry growth on this client",
+          `verify whether ${S("ap") || "its AP"} also reports airtime saturation`,
+        ],
+        usedModel: false,
+      };
+    }
+    case "wifi-congestion": {
+      const rl = radioLabel(S("radio"));
+      return {
+        classification: "informational",
+        confidence: "medium",
+        summary:
+          `AP ${S("ap")} ${rl} ch${N("channel")} is congested: ${N("avgCuTotal")}% average airtime utilisation ` +
+          `(${N("avgNumSta")} clients, tx retries ${N("avgTxRetriesPct")}%, client satisfaction ${N("avgSatisfaction")}%)`,
+        findings: [
+          {
+            statement:
+              `${N("avgCuTotal")}% avg / ${N("maxCuTotal")}% peak airtime on ${S("ap")} ${rl} ch${N("channel")} with ` +
+              `${N("avgNumSta")} clients and satisfaction at ${N("avgSatisfaction")}%`,
+            evidenceKind: "radio-hourly-24h",
+            classification: "supported",
+            metrics: {
+              "avg airtime %": N("avgCuTotal"),
+              "peak airtime %": N("maxCuTotal"),
+              "avg clients": N("avgNumSta"),
+              "avg satisfaction %": N("avgSatisfaction"),
+              "avg tx retries %": N("avgTxRetriesPct"),
+              radio: rl,
+              channel: N("channel"),
+              ap: S("ap"),
+            },
+          },
+        ],
+        uncertainty: [
+          ...gapNote,
+          "airtime utilisation is not throughput; retries run ~20% on normal days at this site",
+          "no neighbour channel-scan telemetry: external interference is inferred, not measured",
+        ],
+        nextSteps: [
+          `move high-bandwidth clients off the ${rl} radio where possible`,
+          `consider a channel change on ch${N("channel")} or narrower channel width`,
+          "check for new interference sources (other APs, microwaves, USB3 hubs)",
+        ],
+        usedModel: false,
+      };
+    }
+    case "wan-outage": {
+      const scope = String(c.scope ?? "heartbeat");
+      if (scope === "ip-change") {
+        return {
+          classification: "informational",
+          confidence: "high",
+          summary:
+            `the router obtained a fresh WAN lease: ${S("previousIp")} -> ${S("wanIp")}; a new lease often follows a line drop or an ISP-side change`,
+          findings: [
+            {
+              statement: `WAN IP changed from ${S("previousIp")} to ${S("wanIp")}`,
+              evidenceKind: "renewals-hourly-48h",
+              classification: "supported",
+              metrics: { "previous WAN IP": S("previousIp"), "new WAN IP": S("wanIp") },
+            },
+          ],
+          uncertainty: [...gapNote, "lease changes are also routine on ISP maintenance"],
+          nextSteps: [
+            "check whether anyone noticed a connectivity blip around the change",
+            "verify port forwards and dynamic DNS still point correctly",
+          ],
+          usedModel: false,
+        };
+      }
+      if (scope === "router-silent") {
+        return {
+          classification: "inconclusive",
+          confidence: "high",
+          summary:
+            `the router's syslog went quiet ${N("routerQuietMin")} minutes ago (last WAN renewal trace was ${S("wanStaleMin") ? `${N("wanStaleMin")}m ago` : "not seen in the 2h lookback"}): WAN state is unknown from telemetry`,
+          findings: [
+            {
+              statement: `router stopped logging ${N("routerQuietMin")}m ago; renewals not seen in the 2h lookback`,
+              evidenceKind: "renewals-hourly-48h",
+              classification: "supported",
+              metrics: { "router quiet minutes": N("routerQuietMin"), renewals: N("renewalsInLookback") },
+            },
+          ],
+          uncertainty: [
+            ...gapNote,
+            "a logging or syslog-forwarding change looks identical to a dead router from here",
+            "the house LAN could be fully healthy while the router's remote syslog path is broken",
+          ],
+          nextSteps: [
+            "check the router is up and its remote-syslog target still configured",
+            "verify syslog ingestion for the router host (Vector on server111)",
+          ],
+          usedModel: false,
+        };
+      }
+      return {
+        classification: "suspicious",
+        confidence: "high",
+        summary:
+          `WAN lease renewals stopped ${N("wanStaleMin")} minutes ago while the router kept logging other traffic: the WAN link likely dropped at the DHCP layer`,
+        findings: [
+          {
+            statement: `no udhcpc renewal for ${N("wanStaleMin")}m (normal: every ~15m) while the router logged other lines ${N("routerQuietMin")}m ago`,
+            evidenceKind: "renewals-hourly-48h",
+            classification: "supported",
+            metrics: {
+              "renewals stale minutes": N("wanStaleMin"),
+              "router last log minutes": N("routerQuietMin"),
+              "renewals in 2h lookback": N("renewalsInLookback"),
+              "WAN IP": S("wanIp"),
+            },
+          },
+        ],
+        uncertainty: [
+          ...gapNote,
+          "this is a DHCP-level heartbeat, not latency or throughput telemetry: the why is invisible",
+          "a router logging-configuration change that silenced udhcpc lines alone would false-positive",
+        ],
+        nextSteps: [
+          "check the router's WAN status page now",
+          "check the ISP outage status for your area",
+          "if the WAN is up, verify udhcpc lines still reach syslog (a logging change also breaks this signal)",
+        ],
         usedModel: false,
       };
     }
@@ -694,6 +950,7 @@ function assembleGenericReport(
     version: 1,
     severity: (p.severity as InvestigationReport["severity"]) ?? def.severity,
     mitreTag: def.mitreTag,
+    preview: buildPreview(def.id, p.candidate ?? {}),
   };
 }
 
@@ -1041,6 +1298,15 @@ function assembleReport(
     },
     createdAtUTC: new Date().toISOString(),
     version: 1,
+    severity:
+      (p.severity as InvestigationReport["severity"]) ??
+      detectorDef("dns-volume")?.severity ??
+      "medium",
+    preview: buildPreview("dns-volume", {
+      clientHash: p.clientHash,
+      candidateCount: p.candidateCount,
+      windowMinutes: p.windowMinutes,
+    }),
   };
 }
 
@@ -1053,10 +1319,10 @@ async function persistReport(env: SchedulerEnv, report: InvestigationReport): Pr
   }
   if (env.REPORTS_D1) {
     await env.REPORTS_D1.prepare(
-      "INSERT INTO reports (id, incident_key, playbook, status, classification, confidence, severity, mitre_tag, latest_version, r2_key, created_at, updated_at, last_seen_at) " +
-        "VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10) " +
+      "INSERT INTO reports (id, incident_key, playbook, status, classification, confidence, severity, mitre_tag, latest_version, r2_key, preview, created_at, updated_at, last_seen_at) " +
+        "VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?11) " +
         "ON CONFLICT (id) DO UPDATE SET latest_version = ?8, classification = ?4, confidence = ?5, " +
-        "severity = ?6, mitre_tag = ?7, updated_at = ?10",
+        "severity = ?6, mitre_tag = ?7, preview = ?10, updated_at = ?11",
     )
       .bind(
         report.id,
@@ -1068,6 +1334,7 @@ async function persistReport(env: SchedulerEnv, report: InvestigationReport): Pr
         report.mitreTag ?? null,
         report.version,
         key,
+        report.preview ?? null,
         report.createdAtUTC,
       )
       .run();
