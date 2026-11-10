@@ -189,6 +189,7 @@ window.FlowvizAsk = (() => {
     limited: "rate limited",
     "model-unavailable": "model unavailable",
     scenario: "scenario",
+    investigated: "investigation",
   };
 
   function render(d, question) {
@@ -233,9 +234,37 @@ window.FlowvizAsk = (() => {
       return;
     }
 
+    // Run 9: the agentic investigate verdict. Falls through to the shared
+    // chart/notes/evidence tail below.
+    if (d.state === "investigated") {
+      if (d.verdict) {
+        const v = document.createElement("div");
+        v.className = "ask-answer";
+        v.textContent = d.verdict;
+        out.appendChild(v);
+      }
+      for (const f of d.investigationFindings || []) {
+        const row = document.createElement("div");
+        row.className = "finding";
+        const st = document.createElement("span");
+        st.className = "state-badge " + (f.classification === "supported" ? "on" : f.classification === "probable" ? "benign" : "off");
+        st.textContent = f.classification;
+        const txt = document.createElement("span");
+        txt.textContent = f.statement;
+        row.append(st, txt);
+        out.appendChild(row);
+      }
+      for (const s of d.nextSteps || []) {
+        const li = document.createElement("div");
+        li.className = "ask-note";
+        li.textContent = "next: " + s;
+        out.appendChild(li);
+      }
+    }
+
     // A real governed query just ran: pulse the flow map's query edges
     // for the primary table (run-3 W3/W6: particles mean real events).
-    if (window.__flowvizQueryPulse && (d.state === "answered" || d.state === "scenario")) {
+    if (window.__flowvizQueryPulse && (d.state === "answered" || d.state === "scenario" || d.state === "investigated")) {
       const t = d.plan && d.plan.table;
       window.__flowvizQueryPulse(t && TABLE_TO_CARD[t] ? [TABLE_TO_CARD[t]] : null);
     }

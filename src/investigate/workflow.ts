@@ -12,6 +12,7 @@ import { catalog } from "../catalog/render";
 import type { EvidenceRecord, Finding, InvestigationReport } from "../catalog/types";
 import type { SchedulerEnv } from "./detectors";
 import { detectorDef } from "./detectors";
+import { persistReport } from "./persist";
 import { buildPreview, radioLabel } from "./preview";
 import { extractModelText } from "../ask/planner";
 import { recordAiUsage } from "../stats/collectors";
@@ -481,6 +482,18 @@ function genericEvidenceSteps(p: InvestigationParams, def: NonNullable<ReturnTyp
         },
       ];
     }
+    case "host-silence": {
+      const host = sqlLit(String(c.host ?? ""));
+      return [
+        {
+          name: "hourly-48h",
+          sql:
+            `SELECT date_trunc('hour', ts) AS h, COUNT(*) AS v ` +
+            `FROM homelab.syslog WHERE host = ${host} AND __ingest_ts >= now() - INTERVAL '48 hours' ` +
+            `GROUP BY 1 ORDER BY h LIMIT 60`,
+        },
+      ];
+    }
     default:
       return [];
   }
@@ -642,6 +655,40 @@ function genericSynthesis(
         usedModel: false,
       };
     }
+    case "host-silence":
+      return {
+        classification: "suspicious",
+        confidence: "medium",
+        summary:
+          `host ${S("host")} stopped logging ${N("quietMin")} minutes ago ` +
+          `(baseline ~${N("avgHourly")} lines/hour, tolerance ${N("toleranceMin")}m): ` +
+          `it crashed, was shut down, or lost its log-ship path`,
+        findings: [
+          {
+            statement: `${S("host")} last logged a line ${N("quietMin")}m ago; normal tolerance is ${N("toleranceMin")}m`,
+            evidenceKind: "hourly-48h",
+            classification: "supported",
+            metrics: {
+              "silent minutes": N("quietMin"),
+              "baseline lines/h": N("avgHourly"),
+              "tolerance minutes": N("toleranceMin"),
+              "lines in 48h": N("lines48h"),
+              host: S("host"),
+            },
+          },
+        ],
+        uncertainty: [
+          ...gapNote,
+          "silence is ambiguous from telemetry: a crash, a clean shutdown and a broken log-ship path look identical",
+          "the host's own console is the only source for why",
+        ],
+        nextSteps: [
+          `check whether ${S("host")} is up and reachable right now`,
+          "if it is up, verify its syslog forwarding (journald/remote syslog target)",
+          "if it is down, power it back on and check the console for a panic",
+        ],
+        usedModel: false,
+      };
     case "telemetry-blind-spot":
       return {
         classification: "inconclusive",
@@ -1310,36 +1357,8 @@ function assembleReport(
   };
 }
 
-async function persistReport(env: SchedulerEnv, report: InvestigationReport): Promise<void> {
-  const key = `reports/${report.id}/v${report.version}.json`;
-  if (env.REPORTS_R2) {
-    await env.REPORTS_R2.put(key, JSON.stringify(report), {
-      httpMetadata: { contentType: "application/json" },
-    });
-  }
-  if (env.REPORTS_D1) {
-    await env.REPORTS_D1.prepare(
-      "INSERT INTO reports (id, incident_key, playbook, status, classification, confidence, severity, mitre_tag, latest_version, r2_key, preview, created_at, updated_at, last_seen_at) " +
-        "VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?11) " +
-        "ON CONFLICT (id) DO UPDATE SET latest_version = ?8, classification = ?4, confidence = ?5, " +
-        "severity = ?6, mitre_tag = ?7, preview = ?10, updated_at = ?11",
-    )
-      .bind(
-        report.id,
-        report.incidentKey,
-        report.playbook,
-        report.conclusion.classification,
-        report.conclusion.confidence,
-        report.severity ?? "medium",
-        report.mitreTag ?? null,
-        report.version,
-        key,
-        report.preview ?? null,
-        report.createdAtUTC,
-      )
-      .run();
-  }
-}
+// persistReport lives in ./persist (run 9: shared with the Ask
+// investigate loop, free of cloudflare:workers imports for testability).
 
 async function deliverReport(env: SchedulerEnv, p: DnsVolumeParams): Promise<void> {
   if (!env.REPORTS_D1) return;

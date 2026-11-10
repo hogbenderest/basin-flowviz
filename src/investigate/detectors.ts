@@ -210,16 +210,52 @@ async function refreshBaselines(env: SchedulerEnv): Promise<void> {
     )
       .bind("dns-volume", "clients", JSON.stringify(baseline), now.toISOString())
       .run();
+    // Run 9: host-silence baseline - per-host 7d hourly syslog volume for
+    // the chatty-host threshold (>= 30 lines/hour) and the entity
+    // glossary refresh in one query.
+    const hosts = await executeGoverned(
+      env,
+      "system",
+      `SELECT host, ROUND(AVG(hc), 1) AS avg_hourly, MAX(last_seen) AS last_seen FROM (` +
+        `SELECT host, date_trunc('hour', ts) AS h, COUNT(*) AS hc, MAX(ts) AS last_seen ` +
+        `FROM homelab.syslog WHERE __ingest_ts >= now() - INTERVAL '7 day' ` +
+        `GROUP BY host, date_trunc('hour', ts)) GROUP BY host ORDER BY avg_hourly DESC LIMIT 100`,
+      { skipExplain: true },
+    );
+    if (hosts.ok && env.REPORTS_D1) {
+      const hb: Record<string, number> = {};
+      const observed: { host: string; lastSeen: string }[] = [];
+      for (const r of hosts.result.rows as Record<string, unknown>[]) {
+        const host = String(r.host ?? "");
+        if (!host) continue;
+        hb[host] = Number(r.avg_hourly ?? 0);
+        observed.push({ host, lastSeen: String(r.last_seen ?? "") });
+      }
+      await env.REPORTS_D1.prepare(
+        "INSERT INTO baselines (detector_id, bucket, payload, updated_at) VALUES (?1, ?2, ?3, ?4) " +
+          "ON CONFLICT(detector_id, bucket) DO UPDATE SET payload = ?3, updated_at = ?4",
+      )
+        .bind("host-silence", "hosts", JSON.stringify(hb), now.toISOString())
+        .run();
+      // Observed hosts feed server-side entity resolution for the
+      // investigate loop (catalog.hosts stays the curated overlay).
+      await metaSet(env, "observed_hosts", JSON.stringify(observed.slice(0, 100)));
+      await metaSet(env, "observed_hosts_updated_at", now.toISOString());
+    }
     await metaSet(env, "baseline_last_run", now.toISOString());
   }
 }
 
-async function loadBaseline(env: SchedulerEnv): Promise<Record<string, number>> {
+async function loadBaseline(
+  env: SchedulerEnv,
+  detectorId = "dns-volume",
+  bucket = "clients",
+): Promise<Record<string, number>> {
   if (!env.REPORTS_D1) return {};
   const r = await env.REPORTS_D1.prepare(
     "SELECT payload FROM baselines WHERE detector_id = ?1 AND bucket = ?2",
   )
-    .bind("dns-volume", "clients")
+    .bind(detectorId, bucket)
     .first<{ payload: string }>();
   if (!r?.payload) return {};
   try {
@@ -254,6 +290,9 @@ const WIFI_CONGESTION_RETRY_PCT = 30; // tx retry percentage
 const WAN_HEARTBEAT_MAX_AGE_MS = 40 * 60_000;
 const WAN_ROUTER_QUIET_MS = 40 * 60_000;
 const WAN_LOOKBACK = "2 hours";
+// Run 9: a host is "chatty" (host-silence eligible) at this 7-day hourly
+// average. Below it, silence is normal and the detector stays quiet.
+const HOST_SILENCE_CHATTY_FLOOR = 30;
 const BLINDSPOT_TABLE_AGE_MS = 20 * 60_000; // freshness cadence + commit lag
 const BLINDSPOT_VECTOR_AGE_MS = 10 * 60_000;
 
@@ -884,6 +923,66 @@ export const DETECTORS: DetectorDef[] = [
         });
       }
       if (wanIp) await metaSet(env, "wan-outage:ip", wanIp).catch(() => {});
+      return outRows;
+    },
+  },
+  {
+    // Run 9: per-host liveness. A chatty host (>= 30 syslog lines/hour
+    // over its 7-day baseline) going quiet past its tolerance means it
+    // crashed, was shut down, or lost its log-ship path - the HTPC was
+    // silent 20 hours and nothing fired before this detector existed.
+    // Baseline lives in the baselines table (refreshBaselines); tolerance
+    // scales with volume (45-180 min) so bursty-but-hourly hosts do not
+    // false-positive.
+    id: "host-silence",
+    mitreTag: null,
+    primaryTable: "homelab.syslog",
+    intervalMs: 15 * 60_000,
+    cooldownMs: 6 * 3600_000,
+    maxPerHour: 2,
+    pausedMs: 1 * 3600_000,
+    severity: "medium",
+    enabled: true,
+    suppressible: true,
+    scan: async (env, from, to) => {
+      const outRows: Candidate[] = [];
+      const date = to.slice(0, 10);
+      const baseline = await loadBaseline(env, "host-silence", "hosts");
+      if (Object.keys(baseline).length === 0) return [];
+      const out = await executeGoverned(
+        env,
+        "system",
+        `SELECT host, MAX(__ingest_ts) AS last_at, COUNT(*) AS n ` +
+          `FROM homelab.syslog WHERE __ingest_ts >= now() - INTERVAL '48 hours' ` +
+          `GROUP BY host HAVING COUNT(*) >= 5 LIMIT 100`,
+        { primaryTable: "homelab.syslog", skipExplain: true },
+      );
+      if (!out.ok) return [];
+      const now = Date.now();
+      for (const r of out.result.rows as Record<string, unknown>[]) {
+        const host = String(r.host ?? "");
+        const avgHourly = Number(baseline[host] ?? 0);
+        if (!host || avgHourly < HOST_SILENCE_CHATTY_FLOOR) continue;
+        const lastAt = Date.parse(String(r.last_at ?? ""));
+        if (!Number.isFinite(lastAt)) continue;
+        const quietMin = Math.round((now - lastAt) / 60_000);
+        // Expected silence between lines ~ 60/avgHourly minutes; alarm at
+        // ~5 expected gaps, clamped to a 45-180 minute window.
+        const toleranceMin = Math.max(45, Math.min(180, Math.round(300 / avgHourly)));
+        if (quietMin <= toleranceMin) continue;
+        outRows.push({
+          key: `host-silence:${host}:${date}`,
+          severity: "medium",
+          candidate: {
+            host,
+            quietMin,
+            avgHourly: Math.round(avgHourly),
+            toleranceMin,
+            lastSeenAt: String(r.last_at ?? ""),
+            lines48h: Number(r.n ?? 0),
+          },
+        });
+      }
       return outRows;
     },
   },

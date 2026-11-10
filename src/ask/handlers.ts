@@ -6,8 +6,9 @@
 import { renderForBrowser, matchVerifiedQuestion } from "../catalog/render";
 import { compilePlan, validateChartAgainstSchema } from "../catalog/validate";
 import type { AskResponse, QueryPlan, QueryResult, EvidenceRecord, ChartSpec, CompiledQuery } from "../catalog/types";
-import { executeGoverned, snapshotEvidence, loadEvidenceRows, rateLimitAsk, QueryLimit, evidenceIdPattern } from "../query/service";
+import { executeGoverned, snapshotEvidence, loadEvidenceRows, rateLimitAsk, rateLimitInvestigate, QueryLimit, evidenceIdPattern } from "../query/service";
 import { planQuestion, repairPlan, narrateAnswer, type PlanSession, type PlanCallResult } from "./planner";
+import { runInvestigation, resolveEntity, entityReferenced } from "./investigate";
 import { assembleScenario } from "../investigate/scenario";
 import type { ServiceEnv } from "../bindings";
 
@@ -167,6 +168,7 @@ async function runPlan(
   | { kind: "unsupported"; note: string }
   | { kind: "failed"; error: string }
   | { kind: "model-unavailable"; error: string }
+  | { kind: "investigate"; plan: QueryPlan }
 > {
   const first = await planQuestion(env, question, session);
   type Attempt =
@@ -174,7 +176,8 @@ async function runPlan(
     | { kind: "ambiguous"; ambiguities: string[]; note?: string }
     | { kind: "unsupported"; note: string }
     | { kind: "failed"; error: string }
-    | { kind: "model-unavailable"; error: string };
+    | { kind: "model-unavailable"; error: string }
+    | { kind: "investigate"; plan: QueryPlan };
   const attempt = async (call: PlanCallResult, repairOf?: QueryPlan): Promise<Attempt> => {
     switch (call.state) {
       case "model-unavailable": {
@@ -204,6 +207,46 @@ async function runPlan(
         const plan = call.plan!;
         if (plan.archetype === "scenario") {
           return { kind: "unsupported", note: "scenario requests are handled by the assembly service" };
+        }
+        // Run 9: causal host questions route to the investigate loop,
+        // which does its own entity resolution (it needs the candidate
+        // list for ambiguous responses).
+        if (plan.archetype === "investigate") {
+          // Honesty net: if the model picked an entity the question never
+          // mentioned, ask instead of investigating a guess.
+          const raw = plan.entity ?? "";
+          if (raw && !entityReferenced(raw, question)) {
+            const res = await resolveEntity(env, raw);
+            const label = res.ok ? res.entity.host : raw;
+            return {
+              kind: "ambiguous",
+              ambiguities: [
+                `why did the ${label} host have a problem?`,
+                "How many wifi and wired clients are connected, and how has that changed over the last 24 hours?",
+              ],
+              note: `the question does not mention "${label}": pick what you meant`,
+            };
+          }
+          return { kind: "investigate", plan };
+        }
+        // Run 9: log-timeline resolves the entity BEFORE compilation so
+        // only a canonical host value ever reaches a query literal.
+        if (plan.archetype === "log-timeline") {
+          const res = await resolveEntity(env, plan.entity ?? "");
+          if (res.ok) {
+            if (plan.entity && !entityReferenced(res.entity.host, question)) {
+              return {
+                kind: "ambiguous",
+                ambiguities: [`show me the log timeline for ${res.entity.host}`],
+                note: `the question does not mention "${res.entity.host}": confirm the host`,
+              };
+            }
+            plan.entity = res.entity.host;
+          } else if (res.kind === "ambiguous") {
+            return { kind: "ambiguous", ambiguities: res.candidates, note: res.note };
+          } else {
+            return { kind: "unsupported", note: res.note };
+          }
         }
         // Session scope as the window fallback: when the model emits
         // missing/unparseable timestamps, the session window is honoured
@@ -304,6 +347,27 @@ export async function handleAsk(env: ServiceEnv, req: Request): Promise<Response
       { state: "failed", question, notes: [out.error] },
       { headers: { "Cache-Control": "no-store" } },
     );
+  }
+
+  // Run 9: the agentic investigate loop (causal host questions).
+  if (out.kind === "investigate") {
+    try {
+      await rateLimitInvestigate(env, user);
+    } catch (e) {
+      if (e instanceof QueryLimit) {
+        return Response.json(
+          {
+            state: "limited",
+            question,
+            notes: ["investigation rate limit: at most 3 per 10 minutes (each burns ~6 governed queries)"],
+          },
+          { status: 429, headers: { "Cache-Control": "no-store" } },
+        );
+      }
+      throw e;
+    }
+    const result = await runInvestigation(env, user, question, out.plan, session);
+    return Response.json(result, { headers: { "Cache-Control": "no-store" } });
   }
 
   // Scenario assembly path (archetype scenario or scoped session request).

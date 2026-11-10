@@ -908,7 +908,11 @@ export default {
       try {
         return await handleAsk(env, boundedReq);
       } catch (e) {
-        // Never leak internals; the state machine above covers expected paths.
+        // Never leak internals; the state machine above covers expected
+        // paths. Bounded server-side diagnosis for the trace table.
+        console.error(
+          `evt=ask.error detail=${JSON.stringify(String(e instanceof Error ? e.stack ?? e.message : e).slice(0, 400))}`,
+        );
         return Response.json(
           { state: "failed", notes: ["ask service error"] },
           { status: 500, headers: { "Cache-Control": "no-store" } },

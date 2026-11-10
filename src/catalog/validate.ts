@@ -14,6 +14,7 @@
 
 import { catalog, getTable, getQuestion } from "./render";
 import { sqlLit } from "../sql";
+import { hourlyVolumeSql, ENTITY_SYNTAX } from "../investigate/taxonomy";
 import type {
   QueryPlan,
   CompiledQuery,
@@ -286,7 +287,9 @@ export function compilePlan(
   // Verified-question shortcut: the catalogue carries either literal SQL or
   // compiler params; both are owner-checked and produce bounded SQL. An
   // unknown id falls through to archetype compilation instead of failing.
-  if (plan.verifiedQueryId) {
+  // Run 9: log-timeline is MORE specific than a fuzzy verified match (the
+  // model sometimes emits both): the entity-explicit archetype wins.
+  if (plan.verifiedQueryId && plan.archetype !== "log-timeline") {
     const v = getQuestion(plan.verifiedQueryId);
     if (v) {
       if (v.status !== "available") {
@@ -359,6 +362,11 @@ export function compilePlan(
   if (plan.archetype === "scenario") {
     // The scenario service handles execution; compilation is not needed.
     return { ok: false, error: "scenario archetype is handled by the assembly service" };
+  }
+  if (plan.archetype === "investigate") {
+    // Run 9: the investigate loop handles execution; compilation is not
+    // needed (it runs several governed queries adaptively).
+    return { ok: false, error: "investigate archetype is handled by the investigation service" };
   }
 
   const tableId = plan.table;
@@ -458,6 +466,39 @@ export function compilePlan(
       const chart = defaultChart("coverage-grid", question, w, "hour", "c", "t");
       return { ok: true, compiled: { sql, primaryTable: "homelab.syslog" }, chart, notes: v.notes, fromUTC: w.fromUTC, toUTC: w.toUTC };
     }
+    case "log-timeline": {
+      // Run 9: single-shot log evidence view for one host. The handler
+      // resolves plan.entity against the curated + observed host sets
+      // BEFORE compilation; ENTITY_SYNTAX is the compile-time backstop.
+      // Shared SQL generator with the investigate loop (no drift).
+      if (tableId !== "homelab.syslog") {
+        return { ok: false, error: "log-timeline is defined over homelab.syslog" };
+      }
+      const entity = String(plan.entity ?? "").trim();
+      if (!entity || !ENTITY_SYNTAX.test(entity)) {
+        return { ok: false, error: "log-timeline needs a valid entity (host identifier)" };
+      }
+      const grain = plan.grain === "day" ? "day" : "hour";
+      const spanMs = Date.parse(w.toUTC) - Date.parse(w.fromUTC);
+      const grainMs = grain === "day" ? 86400_000 : 3600_000;
+      const limit = Math.min(Math.ceil(spanMs / grainMs) + 2, 400);
+      const sql = hourlyVolumeSql(entity, w.fromUTC, w.toUTC, grain, limit);
+      const chart = defaultChart("time-series", question, w, "bucket", "total");
+      chart.missingDataPolicy = "gap";
+      return {
+        ok: true,
+        compiled: { sql, primaryTable: tableId },
+        chart,
+        notes: [
+          ...notes,
+          ...table.caveats,
+          "per-hour pattern-class counts are diagnostic signals, not a partition (one line can match several classes)",
+          "raw line inspection runs in the investigate flow; message bodies are untrusted data",
+        ],
+        fromUTC: w.fromUTC,
+        toUTC: w.toUTC,
+      };
+    }
     default:
       return { ok: false, error: `archetype ${plan.archetype} is not compilable` };
   }
@@ -533,7 +574,9 @@ export const ALLOWED_ARCHETYPES = [
   "rank",
   "latest-state",
   "coverage",
+  "log-timeline",
   "scenario",
+  "investigate",
   "unsupported",
 ] as const;
 

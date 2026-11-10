@@ -84,6 +84,36 @@ export async function rateLimitAsk(env: ServiceEnv, user: string): Promise<void>
   if ((r?.c ?? 0) > cap) throw new QueryLimit("rate");
 }
 
+// Run 9: investigations burn ~6 governed queries (10 MB minimum each) plus
+// two model calls, so they get their own tighter limit: 3 per user per
+// 10 minutes, tracked via the meta table (pruned as they age out).
+export async function rateLimitInvestigate(env: ServiceEnv, user: string): Promise<void> {
+  const WINDOW_MS = 10 * 60_000;
+  const CAP = 3;
+  if (!env.REPORTS_D1) return;
+  const key = `investigate_rate:${user}`;
+  const now = Date.now();
+  const r = await env.REPORTS_D1.prepare("SELECT value FROM meta WHERE key = ?1")
+    .bind(key)
+    .first<{ value: string }>();
+  let stamps: number[] = [];
+  if (r?.value) {
+    try {
+      stamps = (JSON.parse(r.value) as number[]).filter((t) => Number.isFinite(t) && now - t < WINDOW_MS);
+    } catch {
+      stamps = [];
+    }
+  }
+  if (stamps.length >= CAP) throw new QueryLimit("rate");
+  stamps.push(now);
+  await env.REPORTS_D1.prepare(
+    "INSERT INTO meta (key, value, updated_at) VALUES (?1, ?2, ?3) " +
+      "ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
+  )
+    .bind(key, JSON.stringify(stamps), new Date().toISOString())
+    .run();
+}
+
 // ---------------------------------------------------------------------------
 // Freshness cache: MAX(__ingest_ts) per table, refreshed at most once a
 // minute per isolate. Bounded to one day of data to keep the probe cheap.

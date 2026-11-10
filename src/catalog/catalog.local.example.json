@@ -1,5 +1,5 @@
 {
-  "_readme": "Local catalogue overlay. Copy this file to src/catalog/catalog.local.json (gitignored) and put your real values here. Merge rules: entityMaps.<key>, clientHashIdentities and roles are replaced wholesale; questions.<id> overrides apply field by field (e.g. point q-hottest-rooms at your own sensor entity ids). Never commit the populated file.",
+  "_readme": "Local catalogue overlay. Copy this file to src/catalog/catalog.local.json (gitignored) and put your real values here. Merge rules: entityMaps.<key>, clientHashIdentities, roles and hosts are replaced wholesale; questions.<id> overrides apply field by field (e.g. point q-hottest-rooms at your own sensor entity ids). Never commit the populated file.",
   "entityMaps": {
     "temperature": [
       { "entityId": "sensor.temp_main_bedroom", "label": "main bedroom", "room": "main bedroom", "unit": "C", "kind": "room-temp" }
@@ -7,5 +7,8 @@
   },
   "clientHashIdentities": {},
   "roles": { "routerHost": "router" },
+  "hosts": [
+    { "id": "host-media", "label": "media centre (example; put your real syslog hosts here)", "role": "example" }
+  ],
   "questions": {}
 }

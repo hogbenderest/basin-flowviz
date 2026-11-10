@@ -87,6 +87,16 @@ export function buildPreview(
         `WAN lease renewals stopped ${N(c.wanStaleMin)}m ago while the router keeps logging`,
       );
     }
+    case "host-silence":
+      return cap(
+        `host ${S(c.host)} silent ${N(c.quietMin)}m (baseline ~${N(c.avgHourly)} lines/h)`,
+      );
+    case "ask-investigation":
+      return cap(
+        `${S(c.host)}: ${N(c.gapHours)}h log silence` +
+          (c.pipeline ? " (global ingestion hole)" : c.abrupt ? " (abrupt stop)" : "") +
+          " investigated",
+      );
     default:
       return cap(detectorId);
   }

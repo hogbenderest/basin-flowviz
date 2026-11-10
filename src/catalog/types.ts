@@ -21,7 +21,9 @@ export type Archetype =
   | "rank"
   | "latest-state"
   | "coverage"
+  | "log-timeline"
   | "scenario"
+  | "investigate"
   | "unsupported";
 
 export type PrivacyClass = "public" | "sanitized" | "raw";
@@ -73,6 +75,18 @@ export interface EntityMapEntry {
   kind?: "room-temp" | "outdoor" | "weather" | "other";
 }
 
+// Run 9: entity glossary. id is the literal warehouse value (e.g. the
+// syslog host string); label/role are human context. The committed
+// catalogue carries neutral entries; real hostnames arrive via the
+// gitignored local overlay (wholesale merge, W7 pattern). Rendered into
+// the planner prompt for entity resolution; never to the browser.
+export interface HostEntry {
+  id: string;
+  label: string;
+  role?: string;
+  chatty?: boolean;
+}
+
 export interface Catalogue {
   version: number;
   generatedAt: string;
@@ -90,6 +104,10 @@ export interface Catalogue {
   // Never rendered to the model or the browser (renderForModel/
   // renderForBrowser deliberately exclude it).
   roles?: Record<string, string>;
+  // Entity glossary (run 9): curated host identities for entity
+  // resolution in causal questions. Neutral in the committed catalogue;
+  // real values via the local overlay.
+  hosts?: HostEntry[];
   facts: string[]; // live-verified platform findings the planner must respect
 }
 
@@ -118,6 +136,11 @@ export interface QueryPlan {
   };
   grain?: "hour" | "day";
   limit?: number;
+  // Run 9: the warehouse entity the question is about (e.g. "HTPC").
+  // The server resolves it against the curated + observed host sets
+  // before any SQL is parameterised; the raw model string never reaches
+  // a query.
+  entity?: string;
   entityPrefix?: string;
   chart?: {
     type: ChartType;
@@ -251,7 +274,8 @@ export type AskState =
   | "failed"
   | "limited"
   | "model-unavailable"
-  | "scenario";
+  | "scenario"
+  | "investigated";
 
 export interface AskResponse {
   state: AskState;
@@ -267,4 +291,12 @@ export interface AskResponse {
   notes: string[];
   freshness?: QueryResult["freshness"];
   scenarioTimeline?: unknown[]; // for state: "scenario"
+  // Run 9 investigate response (state: "investigated"):
+  verdict?: string; // the synthesised conclusion narrative
+  investigationFindings?: {
+    statement: string;
+    classification: string;
+    metrics?: Record<string, number | string>;
+  }[];
+  nextSteps?: string[];
 }

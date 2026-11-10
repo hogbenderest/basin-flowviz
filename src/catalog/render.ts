@@ -18,6 +18,7 @@ type LocalOverlay = {
   clientHashIdentities?: Catalogue["clientHashIdentities"];
   questions?: Record<string, Partial<VerifiedQuery>>;
   roles?: Catalogue["roles"];
+  hosts?: Catalogue["hosts"];
 };
 
 function mergeCatalog(base: Catalogue, local: LocalOverlay): Catalogue {
@@ -28,6 +29,7 @@ function mergeCatalog(base: Catalogue, local: LocalOverlay): Catalogue {
   if (local.clientHashIdentities)
     out.clientHashIdentities = { ...local.clientHashIdentities };
   if (local.roles) out.roles = { ...local.roles };
+  if (local.hosts) out.hosts = [...local.hosts];
   if (local.questions) {
     out.questions = out.questions.map((q) =>
       local.questions![q.id] ? { ...q, ...local.questions![q.id] } : q,
@@ -84,6 +86,16 @@ export function renderForModel(): string {
   lines.push("");
   lines.push("PLATFORM FACTS (authoritative; never contradict them):");
   for (const f of catalog.facts) lines.push(`- ${f}`);
+  // Run 9: entity glossary for causal host questions. Curated entries
+  // only (observed hosts live in D1 meta and are resolved server-side);
+  // real hostnames arrive via the local overlay, never the browser.
+  if (catalog.hosts?.length) {
+    lines.push("");
+    lines.push("HOSTS (warehouse host identities; use as the entity field):");
+    for (const h of catalog.hosts.slice(0, 20)) {
+      lines.push(`- ${h.id}${h.label && h.label !== h.id ? ` (${h.label})` : ""}`);
+    }
+  }
   return lines.join("\n");
 }
 
