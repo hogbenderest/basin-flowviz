@@ -14,7 +14,7 @@ import type { SchedulerEnv } from "./detectors";
 import { detectorDef } from "./detectors";
 import { persistReport } from "./persist";
 import { buildPreview, radioLabel } from "./preview";
-import { extractModelText } from "../ask/planner";
+import { extractModelText, model, withReasoning } from "../ask/planner";
 import { recordAiUsage } from "../stats/collectors";
 
 export interface DnsVolumeParams {
@@ -1111,7 +1111,7 @@ async function synthesize(
   const fallback = deterministicSynthesis(stats);
   if (!env.AI) return withMetrics(fallback);
   try {
-    const out = (await env.AI.run(env.ASK_MODEL ?? "@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
+    const out = (await env.AI.run(model(env), withReasoning({
       messages: [
         {
           role: "system",
@@ -1121,10 +1121,10 @@ async function synthesize(
         { role: "user", content: JSON.stringify(stats) },
       ],
       response_format: SYNTHESIS_MODEL_SCHEMA,
-      max_tokens: 700,
+      max_tokens: 3072,
       temperature: 0.2,
-    })) as unknown;
-    await recordAiUsage(env, env.ASK_MODEL ?? "@cf/meta/llama-3.3-70b-instruct-fp8-fast", out);
+    }, model(env)))) as unknown;
+    await recordAiUsage(env, model(env), out);
     const text = extractModelText(out);
     if (!text) return fallback;
     const parsed = JSON.parse(stripFence(text)) as Partial<SynthesisResult> & {

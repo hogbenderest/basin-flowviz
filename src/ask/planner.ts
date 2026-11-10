@@ -95,8 +95,10 @@ const PLAN_JSON_SCHEMA = {
   },
 } as const;
 
-function model(env: ServiceEnv): string {
-  return env.ASK_MODEL ?? "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+// The deployment's model. The var in wrangler.jsonc is authoritative;
+// this default keeps local dev and clean checkouts on the same model.
+export function model(env: ServiceEnv): string {
+  return env.ASK_MODEL ?? "@cf/zai-org/glm-5.3";
 }
 
 function systemPrompt(nowISO: string): string {
@@ -252,6 +254,18 @@ export function extractModelText(out: unknown): string | null {
   return null;
 }
 
+// glm-5.3 is a reasoning model: Workers AI defaults it to MAXIMUM
+// reasoning effort, and the chain-of-thought lands in message.reasoning
+// BEFORE message.content - at max effort it can consume the entire
+// max_tokens budget before writing any answer (live-observed 2026-11-10).
+// Reasoning cannot be disabled, only dialled down; "low" keeps the
+// thinking short for these structured plan/narration calls. The effort
+// knob is GLM-specific, so it is only added for glm-5.3 models.
+export function withReasoning(input: Record<string, unknown>, modelId: string): Record<string, unknown> {
+  if (modelId.includes("glm-5.3")) return { ...input, reasoning_effort: "low" };
+  return input;
+}
+
 async function callModel(
   env: ServiceEnv,
   messages: { role: string; content: string }[],
@@ -260,12 +274,12 @@ async function callModel(
 ): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
   if (!env.AI) return { ok: false, error: "AI binding not configured" };
   try {
-    const out = await env.AI.run(model(env), {
+    const out = await env.AI.run(model(env), withReasoning({
       messages,
       response_format: schema,
       max_tokens: maxTokens,
       temperature: 0.2,
-    });
+    }, model(env)));
     // Cost capture (W3): record the usage block when the envelope has it.
     await recordAiUsage(env, model(env), out);
     const text = extractModelText(out);
@@ -305,7 +319,7 @@ export async function planQuestion(
   let lastError = "model unavailable";
   while (attempt < 2) {
     attempt++;
-    const call = await callModel(env, messages, PLAN_JSON_SCHEMA, 900);
+    const call = await callModel(env, messages, PLAN_JSON_SCHEMA, 4096);
     if (!call.ok) {
       return { state: "model-unavailable", error: call.error };
     }
@@ -355,7 +369,7 @@ export async function repairPlan(
       content: `The server rejected that plan: ${validatorError}. Respond with one corrected JSON plan. Do not add prose.`,
     },
   ];
-  const call = await callModel(env, messages, PLAN_JSON_SCHEMA, 900);
+  const call = await callModel(env, messages, PLAN_JSON_SCHEMA, 4096);
   if (!call.ok) return { state: "model-unavailable", error: call.error };
   const plan = coercePlan(extractJson(call.text));
   if (!plan) return { state: "model-unavailable", error: "repair output did not parse" };
@@ -405,7 +419,7 @@ export async function narrateAnswer(
     },
   };
   try {
-    const out = (await env.AI.run(model(env), {
+    const out = (await env.AI.run(model(env), withReasoning({
       messages: [
         {
           role: "system",
@@ -422,9 +436,11 @@ export async function narrateAnswer(
         },
       ],
       response_format: schema,
-      max_tokens: 220,
+      // Reasoning headroom: glm-5.3 thinks before it writes (see
+      // withReasoning); a 220-token cap produced empty content.
+      max_tokens: 3000,
       temperature: 0.2,
-    })) as { response?: string } | null;
+    }, model(env)))) as { response?: string } | null;
     await recordAiUsage(env, model(env), out);
     const text = extractModelText(out);
     if (text) {
@@ -497,7 +513,7 @@ export async function synthesizeVerdict(
     },
   };
   try {
-    const out = (await env.AI.run(model(env), {
+    const out = (await env.AI.run(model(env), withReasoning({
       messages: [
         {
           role: "system",
@@ -510,9 +526,9 @@ export async function synthesizeVerdict(
         },
       ],
       response_format: schema,
-      max_tokens: 500,
+      max_tokens: 3072,
       temperature: 0.2,
-    })) as { response?: string } | null;
+    }, model(env)))) as { response?: string } | null;
     await recordAiUsage(env, model(env), out);
     const text = extractModelText(out);
     if (text) {

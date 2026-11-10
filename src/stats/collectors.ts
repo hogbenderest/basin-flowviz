@@ -23,14 +23,14 @@ const R2_USD_PER_GB_MONTH = 0.015;
 
 // Published per-model neuron rates: input and output neurons per
 // million tokens (Workers AI pricing table, 2026-10-25). The default
-// is the deployment's ASK_MODEL.
+// is the deployment's ASK_MODEL (glm-5.3 since 2026-11-10).
 const MODEL_NEURONS: Record<string, { inPerM: number; outPerM: number }> = {
   "@cf/meta/llama-3.3-70b-instruct-fp8-fast": { inPerM: 26_668, outPerM: 204_805 },
   "@cf/meta/llama-3.1-70b-instruct-fp8-fast": { inPerM: 26_668, outPerM: 204_805 },
   "@cf/zai-org/glm-5.3-flash": { inPerM: 13_636, outPerM: 45_455 },
   "@cf/zai-org/glm-5.3": { inPerM: 127_273, outPerM: 400_000 },
 };
-const DEFAULT_NEURONS = MODEL_NEURONS["@cf/meta/llama-3.3-70b-instruct-fp8-fast"];
+const DEFAULT_NEURONS = MODEL_NEURONS["@cf/zai-org/glm-5.3"];
 
 // Tables expected to flow continuously; only these feed the worst-age
 // headline (toggle-dependent or batch sources can idle honestly without
